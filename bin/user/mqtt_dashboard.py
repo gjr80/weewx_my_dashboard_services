@@ -59,17 +59,22 @@ import sys
 import threading
 import time
 
+# Python2/3 imports in different libraries
 try:
     import queue as Queue
 except ImportError:
     import Queue
+
 try:
-    from urllib.parse import urlparse
+    from urllib.error import URLError
+    from urllib.parse import quote, urlparse, urlencode, parse_qs
+    from urllib.request import urlopen
 except ImportError:
-    from urlparse import urlparse
+    from urllib import quote, urlencode
+    from urllib2 import urlopen, URLError
+    from urlparse import urlparse, parse_qs
 
 # WeeWX imports
-import user.aeris
 import weeutil
 import weeutil.Moon
 import weewx
@@ -863,7 +868,7 @@ class MqttDashboardAerisThread(threading.Thread):
         # Refer weewx.conf for details.
         self.query = aeris_config_dict.get('location', (lat, long))
         # get an AerisAPI object to handle the API calls
-        self.api = user.aeris.AerisAPI(client_id, client_secret)
+        self.api = AerisAPI(client_id, client_secret)
 
         # initialise night flag
         self.night = None
@@ -1092,6 +1097,109 @@ class MqttDashboardAerisThread(threading.Thread):
             wind_str = ''
         return '. '.join([temp_str, rain_str, wind_str, uv_str])
 
+
+# ============================================================================
+#                               class AerisAPI
+# ============================================================================
+
+class AerisAPI(object):
+    """Query the Aeris API and return the API response.
+
+    Data is obtained from the Aeris API by accessing one or more endpoints. The
+    available endpoints depend on the user's subscription level. This class
+    supports access to a limited suite of Aeris API endpoints to support
+    various WeeWX extensions.
+
+    AerisAPI constructor parameters:
+
+        api_key: WeatherUnderground API key to be used.
+
+    AerisAPI methods:
+
+        data_request. Submit a data feature request to the WeatherUnderground
+                      API and return the response.
+    """
+
+    BASE_URL = 'https://api.aerisapi.com'
+    SUPPORTED_ENDPOINTS = ['forecasts', 'observations']
+
+    def __init__(self, client_id, client_secret):
+        # initialise a AerisAPI object
+
+        # save the client ID and secret to be used
+        self.client_id = client_id
+        self.client_secret = client_secret
+
+    def request(self, endpoint=None, action=None, parameters=None, max_tries=3):
+        """Request data from and endpoint.
+
+        Construct the URL to be used for an API call, make the call and return
+        the response.
+
+        Parameters:
+            endpoint:    The Aeris API endpoint to be used. String.
+            action:      A modifier to support the endpoint, for example a
+                         location for which the data is require. String.
+            parameters:  Optional parameters to be to be included in the API
+                         call eg filter to filter to limit the results.
+                         Dictionary with elements in the format parameter: value.
+            max_tries:   The maximum number of attempts to be made to obtain a
+                         response from the API. Default is 3.
+
+        Returns:
+            The API response in JSON format or the value None if the requested
+            data could not be obtained.
+        """
+
+        # do we have an endpoint and is it an endpoint we know about
+        if endpoint is not None and endpoint.lower() in AerisAPI.SUPPORTED_ENDPOINTS:
+            action_str = quote('/%s' % action) if action is not None else ''
+            client_dict = {'client_id': self.client_id,
+                           'client_secret': self.client_secret}
+            if parameters is not None:
+                try:
+                    client_dict.update(parameters)
+                    params_dict = client_dict
+                except (TypeError, AttributeError):
+                    logdbg("Ignoring invalid API query parameter format: '%s'" % (parameters,))
+                    params_dict = client_dict
+            else:
+                params_dict = client_dict
+            params = urlencode(params_dict)
+            url = "%s/%s%s?%s" % (AerisAPI.BASE_URL,
+                                  endpoint,
+                                  action_str,
+                                  params)
+            # obtain a version of the url with client_id and client_secret
+            # obfuscated
+            obf_url = obfuscate_client(url)
+            # log the url used
+            logdbg("Submitting Aeris API call using URL: %s" % (obf_url,))
+            # we will attempt the call max_tries times
+            for count in range(max_tries):
+                # attempt the call
+                try:
+                    request = urlopen(url)
+                    response = request.read()
+                except (URLError, socket.timeout) as e:
+                    logerr("Failed to get endpoint '%s' on attempt %d" % (endpoint,
+                                                                          count + 1))
+                    logerr("   **** %s" % e)
+                else:
+                    response_json = json.loads(response)
+                    if response_json['success']:
+                        return response_json
+                    else:
+                        loginf("An error was encountered in the API response: %s" % (response_json['error']['description']))
+                        request.close()
+                        continue
+            else:
+                logerr("Failed to get endpoint '%s'" % endpoint)
+            return None
+        else:
+            # either no endpoint was provided or we don't know how to process
+            # that endpoint, either way log it and return None
+            logdbg("Invalid or unsupported endpoint '%s' provided" % (endpoint,))
 
 # ============================================================================
 #                             class MQTTDashboardSlow
@@ -2044,3 +2152,43 @@ def obfuscate_password(url, o_str='xxx'):
         # re-assemble the URL
         url = parts.geturl()
     return url
+
+
+def obfuscate_client(url, obf_ch='x'):
+    """Obfuscate the client_id and client_secret query parameters in a URL.
+
+    Splits the URL into it's six component parts and then obfuscates the
+    client_id and client_secret parameters in the query component. The URL is
+    re-assembled from the component parts and returned with the obfuscated
+    parameters.
+    """
+
+    # obtain the URL component parts
+    url_parts = urlparse(url)
+    # do we have any query parameters
+    if len(url_parts[4]) > 0:
+        # now parse the query string
+        q_dict = parse_qs(url_parts[4])
+        # we only need to do something if we have a client_id or a
+        # client_secret query parameter
+        if 'client_id' in q_dict or 'client_secret' in q_dict:
+            if 'client_id' in q_dict:
+                # replace the client_id value with an obfuscated version
+                q_dict['client_id'] = ''.join([obf_ch * (len(q_dict['client_id'][0]) - 4),
+                                               q_dict['client_id'][0][-4:]])
+            if 'client_secret' in q_dict:
+                # replace the client_secret value with an obfuscated version
+                q_dict['client_secret'] = ''.join([obf_ch * (len(q_dict['client_secret'][0]) - 4),
+                                                   q_dict['client_secret'][0][-4:]])
+            # replace the query tuple in the decomposed url with the obfuscated
+            # version
+            url_parts = url_parts._replace(query=urlencode(q_dict))
+            # return then re-assemble the URL
+            return url_parts.geturl()
+        else:
+            # we had query parameters but noe we had to change so return the
+            # original url
+            return url
+    else:
+        # there is no query parameters so return the original url
+        return url
