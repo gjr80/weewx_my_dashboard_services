@@ -51,13 +51,14 @@ DayCache - a specialist cache of day based observation data
 import configobj
 import datetime
 import json
+import math
 import operator
 import paho.mqtt.client as mqtt
 import random
 import socket
-import sys
 import threading
 import time
+from operator import itemgetter
 
 # Python2/3 imports in different libraries
 try:
@@ -77,15 +78,17 @@ except ImportError:
 # WeeWX imports
 import weeutil
 import weeutil.Moon
+import weeutil.weeutil
 import weewx
 import weewx.almanac
 import weewx.engine
 import weewx.manager
 import weewx.restx
 import weewx.tags
+import weewx.xtypes
 from weeutil.config import conditional_merge
 from weewx.units import ValueTuple
-from weeutil.weeutil import to_bool, to_float, to_int, timestamp_to_string, accumulateLeaves
+from weeutil.weeutil import to_bool, to_float, to_int, timestamp_to_string
 
 # import/setup logging, WeeWX v3 is syslog based but WeeWX v4 is logging based,
 # try v4 logging and if it fails use v3 logging
@@ -146,6 +149,13 @@ except ImportError:
     def log_traceback_error(prefix=''):
         log_traceback(prefix=prefix, loglevel=syslog.LOG_ERR)
 
+# length of history to be maintained in seconds
+MAX_AGE = 600
+# obs for which we need a running sum
+SUM_MANIFEST = ['rain']
+# obs for which we need a history
+HIST_MANIFEST = ['windSpeed', 'windDir', 'windGust', 'wind']
+
 
 # ============================================================================
 #                     Exceptions that could get thrown
@@ -164,307 +174,27 @@ class FailedPost(IOError):
 
 
 # ============================================================================
-#                            class MQTTDashboard
+#                         class MqttDashboardService
 # ============================================================================
 
-class MQTTDashboard(weewx.restx.StdRESTbase):
-    """Class to publish MQTT messages to a broker for use by the bootstrap dashboard.
-
-        The basic process is to:
-        1.  convert incoming loop packets to METRIC,
-        2.  update the day cache with the converted packet,
-        3.  extract from the day cache a loop packet with max-min data,
-        4.  pass the max-min packet to MQTTDashboard thread via a queue
-        5.  the MQTTDashboard thread publishes the max-min packet
-
-        This service recognizes standard restful options plus the following:
-
-        Required parameters:
-
-        server_url: URL of the broker, e.g., something of the form
-          mqtt://username:password@localhost:1883/
-        Default is None
-
-        Optional parameters:
-
-        unit_system: one of US, METRIC, or METRICWX
-        Default is None; units will be those of data in the database
-
-        topic: the MQTT topic under which to post
-        Default is 'weather'
-
-        obs_to_upload: Which observations to upload.  Possible values are
-        none or all.  When none is specified, only items in the inputs list
-        will be uploaded.  When all is specified, all observations will be
-        uploaded, subject to overrides in the inputs list.
-        Default is all
-
-        inputs: dictionary of weewx observation names with optional upload
-        name, format, and units
-        Default is None
-
-        tls: dictionary of TLS parameters used by the Paho client to establish
-        a secure connection with the broker.
-        Default is None
-    """
-    version = '0.1.0'
-
-    def __init__(self, engine, config_dict):
-
-        # initialise our base class
-        super(MQTTDashboard, self).__init__(engine, config_dict)
-
-        loginf("Initializing version %s" % MQTTDashboard.version)
-        # obtain our site config dict, fail hard if we are missing any critical
-        # config entries
-        try:
-            site_dict = config_dict['StdRESTful']['MQTTDashboard']
-            site_dict = accumulateLeaves(site_dict, max_level=1)
-            site_dict['server_url']
-        except KeyError as e:
-            logerr("Data will not be uploaded: Missing option %s" % e)
-            return
-
-        # set defaults for any missing optional config entries
-        site_dict.setdefault('client_id', '')
-        site_dict.setdefault('topic', 'weather')
-        site_dict.setdefault('augment_record', True)
-        site_dict.setdefault('obs_to_upload', 'all')
-        site_dict.setdefault('retain', False)
-        site_dict.setdefault('qos', 0)
-        site_dict.setdefault('unit_system', 'METRIC')
-
-        if 'tls' in config_dict['StdRESTful']['MQTTDashboard']:
-            site_dict['tls'] = dict(config_dict['StdRESTful']['MQTTDashboard']['tls'])
-
-        if 'inputs' in config_dict['StdRESTful']['MQTTDashboard']:
-            site_dict['inputs'] = dict(config_dict['StdRESTful']['MQTTDashboard']['inputs'])
-
-        site_dict['augment_record'] = to_bool(site_dict.get('augment_record'))
-        site_dict['retain'] = to_bool(site_dict.get('retain'))
-        site_dict['qos'] = to_int(site_dict.get('qos'))
-        binding = site_dict.pop('binding', 'archive')
-
-        # if we are supposed to augment the record with data from weather
-        # tables, then get the manager dict to do it.  there may be no weather
-        # tables, so be prepared to fail.
-        try:
-            if site_dict.get('augment_record'):
-                _manager_dict = weewx.manager.get_manager_dict_from_config(
-                    config_dict, 'wx_binding')
-                site_dict['manager_dict'] = _manager_dict
-        except weewx.UnknownBinding:
-            pass
-
-        # obtain the unit system to use for uploads, default to METRIC
-        self.unit_system = weewx.units.unit_constants.get(site_dict.pop('unit_system', 'METRIC').upper(),
-                                                          weewx.METRIC)
-
-        # create a Queue object for our thread and then start the thread to do
-        # the publishing
-        self.loop_queue = Queue.Queue()
-        self.loop_thread = MqttDashboardThread(self.loop_queue, **site_dict)
-        self.loop_thread.start()
-
-        # obtain a DayCache object to keep track of day max/min etc
-        self.day_cache = DayCache()
-
-        # bind ourselves to the NEW_LOOP_PACKET event
-        self.bind(weewx.NEW_LOOP_PACKET, self.new_loop_packet)
-
-        # now log our config
-        loginf("Binding to %s" % binding)
-        loginf("Data will be uploaded to %s" %
-               obfuscate_password(site_dict['server_url']))
-        if 'topic' in site_dict:
-            topic_msg = "Topic is %s," % site_dict['topic']
-        else:
-            topic_msg = ''
-        loginf("%s qos is %d, retain is %r." % (topic_msg,
-                                                site_dict['qos'],
-                                                site_dict['retain']))
-        if site_dict['obs_to_upload'].lower() == 'all':
-            loginf("All fields will be uploaded")
-        elif 'inputs' in site_dict:
-            inputs_str = ', '.join(sorted(site_dict['inputs'].keys(), key=str.lower))
-            loginf("The following fields will be uploaded: %s" % inputs_str)
-        loginf("Data will be uploaded using the %s unit "
-               "system" % weewx.units.unit_nicknames.get(self.unit_system))
-        if 'tls' in site_dict:
-            loginf("Network encryption/authentication will be attempted")
-
-    def new_loop_packet(self, event):
-        """Process a new loop packet."""
-
-        # first convert the packet to our unit system, we need to do this
-        # before we add the packet to the day cache because the day cache
-        # provides a packet that includes max-min data preventing us from using
-        # WeeWX converters to convert it.
-        conv_packet = weewx.units.to_std_system(event.packet, self.unit_system)
-        # update the day cache
-        self.day_cache.update(conv_packet, conv_packet['dateTime'])
-        # extract and queue a max-min packet
-        self.loop_queue.put(self.day_cache.get_max_min_packet(conv_packet['dateTime']))
-
-
-# ============================================================================
-#                         class MqttDashboardThread
-# ============================================================================
-
-class MqttDashboardThread(weewx.restx.RESTThread):
-    """Class to publish data to a MQTT broker.
-
-    Runs in a thread.
-    """
-
-    def __init__(self, queue, server_url,
-                 client_id='', topic='', skip_upload=False,
-                 augment_record=True, retain=False,
-                 inputs={}, obs_to_upload='all',
-                 manager_dict=None, tls=None, qos=0,
-                 post_interval=None, stale=None,
-                 log_success=True, log_failure=True,
-                 timeout=60, max_tries=3, retry_wait=5,
-                 max_backlog=sys.maxsize):
-
-        # initialise our base class
-        super(MqttDashboardThread, self).__init__(queue,
-                                                  protocol_name='MQTT',
-                                                  manager_dict=manager_dict,
-                                                  post_interval=post_interval,
-                                                  max_backlog=max_backlog,
-                                                  stale=stale,
-                                                  log_success=log_success,
-                                                  log_failure=log_failure,
-                                                  max_tries=max_tries,
-                                                  timeout=timeout,
-                                                  retry_wait=retry_wait)
-
-        self.server_url = server_url
-        self.client_id = client_id
-        self.topic = topic
-        self.tls_dict = {}
-        if tls is not None:
-            # we have TLS options so construct a dict to configure Paho TLS
-            dflts = TLSDefaults()
-            for opt in tls:
-                if opt == 'cert_reqs':
-                    if tls[opt] in dflts.CERT_REQ_OPTIONS:
-                        self.tls_dict[opt] = dflts.CERT_REQ_OPTIONS.get(tls[opt])
-                elif opt == 'tls_version':
-                    if tls[opt] in dflts.TLS_VER_OPTIONS:
-                        self.tls_dict[opt] = dflts.TLS_VER_OPTIONS.get(tls[opt])
-                elif opt in dflts.TLS_OPTIONS:
-                    self.tls_dict[opt] = tls[opt]
-            logdbg("TLS parameters: %s" % self.tls_dict)
-        self.retain = retain
-        self.qos = qos
-        self.skip_upload = skip_upload
-        self.upload_all = True if obs_to_upload.lower() == 'all' else False
-        self.inputs = inputs
-        loginf("inputs=%s" % (self.inputs,))
-        self.augment_record = augment_record
-        self.templates = dict()
-
-    def filter_data(self, record):
-        """Filter records.
-
-        Filter and format record contents before publishing. Returns a dict.
-        """
-
-        # if we are uploading all then return the record unchan ged
-        if self.upload_all:
-            return record
-        else:
-            # we are limiting the fields to those under [[[inputs]]]
-            # first create a record with only usUnits, we don't want the user
-            # to inadvertently leave usUnits out
-            data = {'usUnits': record['usUnits']}
-            # iterate over each of the keys in our input config, if that key is
-            # in the record then add the record field to our dict
-            for f in self.inputs:
-                if f in record:
-                    data[f] = record[f]
-            # return our data
-            return data
-
-    def process_record(self, record, dbm):
-
-        data = self.filter_data(record)
-        if weewx.debug >= 2:
-            logdbg("data: %s" % data)
-        if self.skip_upload:
-            loginf("skipping publication")
-            return
-        self.publish(json.dumps(data))
-
-    def publish(self, data):
-        """Publish an MQTT message.
-
-        Attempt to publish 'data' to an MQTT broker. TLS is supported if
-        configured as is retention and QoS. self.max_tries attempts will be
-        made to publish before giving up.
-        """
-
-        url = urlparse(self.server_url)
-        for _count in range(self.max_tries):
-            try:
-                client_id = self.client_id
-                if not client_id:
-                    pad = "%032x" % random.getrandbits(128)
-                    client_id = 'weewx_%s' % pad[:8]
-                mc = mqtt.Client(client_id=client_id)
-                if url.username is not None and url.password is not None:
-                    mc.username_pw_set(url.username, url.password)
-                # if we have TLS opts configure TLS on our broker connection
-                if len(self.tls_dict) > 0:
-                    mc.tls_set(**self.tls_dict)
-                mc.connect(url.hostname, url.port)
-                mc.loop_start()
-                (res, mid) = mc.publish(self.topic,
-                                        data,
-                                        retain=self.retain,
-                                        qos=self.qos)
-                if res != mqtt.MQTT_ERR_SUCCESS:
-                    logerr("publish failed for %s: %s" % (self.topic, res))
-                mc.loop_stop()
-                mc.disconnect()
-                return
-            except (socket.error, socket.timeout, socket.herror) as e:
-                logdbg("Failed publish attempt %d: %s" % (_count + 1, e))
-            time.sleep(self.retry_wait)
-        else:
-            raise weewx.restx.FailedPost("Failed to publish after %d tries" %
-                                         (self.max_tries,))
-
-
-# ============================================================================
-#                         class MQTTDashboardService
-# ============================================================================
-
-class MQTTDashboardService(weewx.engine.StdService):
+class MqttDashboardService(weewx.engine.StdService):
     """Base class Service that publishes data to an MQTT broker.
 
-    The MQTTDashboardSlow class creates and controls a threaded object of class
-    MQTTDashboardSlowThread that generates slow changing JSON data once each archive
-    period and publishes this data to a MQTT broker.
+    Creates a Queue object for passing loop packets and archive records to its
+    subordinate thread. Also passes None via the Queue object as a signal to
+    the subordinate thread to close.
 
-    MQTTDashboardSlow constructor parameters:
+    Includes methods for placing loop packets and archive records in the Queue,
+    derived classes should include their own bindings to the relevant WeeWX
+    events to utilise these functions as required.
 
-        engine:      a WeeWX engine, usually an instance of
-                     weewx.engine.StdEngine
-        config_dict: a WeeWX config dictionary
-
-    MQTTDashboardSlow methods:
-
-        new_archive_record. Action to be taken upon receipt of a new archive
-                            record.
-        ShutDown.           Shutdown any child threads.
+    The shutDown method passes None via the Queue to the subordinate thread as
+    a signal to shut down.
     """
 
     def __init__(self, engine, config_dict, service_dict):
         # initialize my superclass
-        super(MQTTDashboardService, self).__init__(engine, config_dict)
+        super(MqttDashboardService, self).__init__(engine, config_dict)
 
         # create a Queue object to pass data to our thread
         self.queue = Queue.Queue()
@@ -513,10 +243,308 @@ class MQTTDashboardService(weewx.engine.StdService):
 
 
 # ============================================================================
+#                        class MqttDashboardRealtime
+# ============================================================================
+
+class MqttDashboardRealtime(MqttDashboardService):
+    """Service that publishes loop based data to a MQTT broker."""
+
+    version = '0.1.0'
+
+    def __init__(self, engine, config_dict):
+
+        # first up say what we are loading
+        loginf("Loading service MqttDashboardRealtime v%s" % MqttDashboardRealtime.version)
+
+        # obtain config dicts for our service
+        # first do we have a MQTTDashboard stanza in the config dict
+        if 'MQTTDashboard' in config_dict:
+            # we have a MQTTDashboard stanza now get the [[Realtime]] stanza as a
+            # config dict
+            rt_config_dict = configobj.ConfigObj(config_dict['MQTTDashboard'].get('Realtime',
+                                                                                  dict()))
+            # get the [[[MQTT]]] stanza from the Realtime config dict
+            mqtt_config_dict = configobj.ConfigObj(rt_config_dict.get('MQTT', dict()))
+            # merge in any MQTT config from [MQTTDashboard] [[MQTT]]
+            conditional_merge(mqtt_config_dict, config_dict['MQTTDashboard'].get('MQTT',
+                                                                                 dict()))
+            # ensure we have any essential MQTT config, just call the essential
+            # config elements and catch any KeyErrors
+            try:
+                _ = mqtt_config_dict['server_url']
+                _ = mqtt_config_dict['topic']
+            except KeyError as e:
+                logerr("Service MqttDashboardRealtime not loaded: Missing option %s" % (e,))
+                return
+        else:
+            # if we have no MQTTDashboard config dict, ie [MQTTDashboard], we
+            # can't go on so log the failure and return
+            loginf("Service MqttDashboardRealtime not loaded: missing [MQTTDashboard] stanza")
+            return
+
+        # now we can initialize my superclass
+        super(MqttDashboardRealtime, self).__init__(engine, config_dict, rt_config_dict)
+
+        # get a manager config dict, we need this to access the database
+        manager_dict = weewx.manager.get_manager_dict_from_config(config_dict,
+                                                                  'wx_binding')
+
+        # get an instance of class MqttDashboardRealtimeThread and start the
+        # thread running
+        self.thread = MqttDashboardRealtimeThread(queue=self.queue,
+                                                  rt_config_dict=rt_config_dict,
+                                                  mqtt_config_dict=mqtt_config_dict,
+                                                  manager_dict=manager_dict)
+        self.thread.start()
+
+        # bind ourself to the WeeWX NEW_LOOP_PACKET event
+        self.bind(weewx.NEW_LOOP_PACKET, self.new_loop_packet)
+
+        # bind ourself to the WeeWX NEW_ARCHIVE_RECORD event
+        self.bind(weewx.NEW_ARCHIVE_RECORD, self.new_archive_record)
+
+
+# ============================================================================
+#                       class MqttDashboardAerisThread
+# ============================================================================
+
+class MqttDashboardRealtimeThread(threading.Thread):
+    """Thread to publish loop based data to a MQTT broker."""
+
+    # list of obs that we will attempt to buffer
+    MANIFEST = ['outTemp', 'barometer', 'outHumidity', 'rain', 'rainRate',
+                'humidex', 'windchill', 'heatindex', 'windSpeed', 'inTemp',
+                'appTemp', 'dewpoint', 'windDir', 'UV', 'radiation', 'wind',
+                'windGust', 'windGustDir', 'windrun']
+
+
+
+    def __init__(self, queue, rt_config_dict, mqtt_config_dict, manager_dict):
+
+        # Initialize my superclass
+        threading.Thread.__init__(self)
+
+        # set my thread and run as a daemon
+        self.setName('MqttDashboardRealtimeThread')
+        self.setDaemon(True)
+        # our queue for receiving data
+        self.queue = queue
+        # manager dict so we can access the database
+        self.manager_dict = manager_dict
+
+        # MQTT broker URL
+        server_url = mqtt_config_dict.get('server_url')
+        # topics to publish to
+        self.topic = mqtt_config_dict.get('topic', 'weather/realtime')
+        # TLS options
+        tls_opt = mqtt_config_dict.get('tls', None)
+        # quality of service
+        qos = to_int(mqtt_config_dict.get('tls', 0))
+        # will MQTT broker retain messages
+        retain = to_bool(mqtt_config_dict.get('retain', True))
+        # log successful publishing of data
+        log_success = to_bool(mqtt_config_dict.get('log_success', False))
+
+        # the fields we are to include in our output
+        self.inputs = rt_config_dict.get('inputs', {})
+
+        # do our config logging before the Publisher
+        loginf("Data will be published to %s under topic '%s'" % (obfuscate_password(server_url),
+                                                                  self.topic))
+        loginf("qos is %d, retain is %r, log success is %s" % (qos, retain, log_success))
+
+        # get a MQTTPublisher object to do the publishing for us
+        self.publisher = MqttPublisher(server_url=server_url,
+                                       tls=tls_opt,
+                                       retain=retain,
+                                       qos=qos,
+                                       log_success=log_success)
+
+        # initialise some properties we will use
+        # TimeSpan for the current day
+        self.day_span = None
+        # is it a new day, used for 9am resets
+        self.new_day = True
+        # db manager
+        self.db_manager = None
+        # stats unit system
+        self.stats_unit_system = None
+        # Buffer object
+        self.buffer = None
+
+    def run(self):
+        """Collect data from the queue and manage its processing."""
+
+        # get a db manager
+        self.db_manager = weewx.manager.open_manager(self.manager_dict)
+        # obtain the current day stats so we can initialise a Buffer object
+        day_stats = self.db_manager._get_day_summary(time.time())
+        # save our day stats unit system for use later
+        self.stats_unit_system = day_stats.unit_system
+        # get a Buffer object
+        self.buffer = Buffer(MqttDashboardRealtimeThread.MANIFEST,
+                             day_stats=day_stats)
+        # wrap our main processing loop in a try..except, if any exceptions are
+        # raised we want to be able to capture them and provide feedback rather
+        # than the thread just silently dying
+        try:
+            # Run a continuous loop, processing data received in the queue. Only
+            # break out if we receive the shutdown signal (None) from our parent.
+            while True:
+                # Run an inner loop checking for the shutdown signal and keeping
+                # the queue length from getting too long. If a loop packet is
+                # received break out of the loop and process it
+                while True:
+                    _package = self.queue.get()
+                    if _package is None:
+                        # None is our signal to exit, disconnect cleanly if we
+                        # have already connected then return
+                        if self.publisher:
+                            self.publisher.disconnect()
+                        return
+                    # if packets have backed up in the queue, trim it until it's no
+                    # bigger than the max allowed backlog
+                    if self.queue.qsize() <= 5:
+                        break
+
+                # we now have a packet to process
+                # First, log receipt. The amount of logging depends on the debug
+                # level.
+                if weewx.debug >= 2:
+                    logdbg("Received loop packet")
+                elif weewx.debug >= 3:
+                    logdbg("Received loop packet: %s" % (_package, ))
+                # and finally process the packet
+                self.process_packet(_package)
+        except Exception as e:
+            # Some unknown exception occurred. This is probably a serious
+            # problem. Exit.
+            logcrit("Unexpected exception of type %s" % (type(e), ))
+            log_traceback_critical('mqttdashboardrealtimethread: **** ')
+            logcrit("Thread exiting. Reason: %s" % (e, ))
+
+    def process_packet(self, packet):
+        """Process a loop packet."""
+
+        # get the current time for debug timing
+        t1 = time.time()
+        # if we have the first packet from a new day we need to reset the Buffer
+        # objects stats
+        if self.day_span is not None:
+            # we have a day_span so this is not our first time, check to see if
+            # our packet timestamp belongs to the following day
+            if packet['dateTime'] > self.day_span.stop:
+                # we have a packet from a new day, so reset the Buffer stats
+                self.buffer.start_of_day_reset()
+                # and reset our day_span
+                self.day_span = weeutil.weeutil.archiveDaySpan(packet['dateTime'])
+                # and set the new_day proprty to True
+                self.new_day = True
+            # If this is the first packet after 9am we need to reset any 9am
+            # sums. There is a bit a dilemma here, a packet timestamped at 9am
+            # actually has data from the period before 9am, so if we reset when
+            # the packet is timestamped 9am we might then add data to our
+            # buffer that was from before 9am. But if we reset on the first
+            # packet after 9am we may be displaying yesterdays rain from 9am
+            # until that next packet comes in. Since loop packets come in very
+            # regularly we will choose to reset on the first packet after 9am.
+
+            # first get the hour and minutes of the packet timestamp as an ints
+            _hms = time.strftime('%H:%M:%S', time.localtime(packet['dateTime']))
+            _h, _m, _s = [int(x) for x in _hms.split(':')]
+            # if its a new day and hour >= 9 and minute > 0 or second > 0 we need
+            # to reset any 9am sums
+            if self.new_day and _h >= 9 and (_m > 0 or _s > 0):
+                self.new_day = False
+                self.buffer.nineam_reset()
+        else:
+            # we don't have a day_span, it must be the first packet since we
+            # started, so initialise a day_span
+            self.day_span = weeutil.weeutil.archiveDaySpan(packet['dateTime'])
+            # now that we have our first packet we can initialise the 9am rain
+            # sum in our Buffer object, we couldn't do it earlier as we did not
+            # know which 9am to use, yesterdays or todays
+            self.buffer['rain'].nineam_sum = self.get_nineam_rain(packet['dateTime'])
+
+        # convert our incoming packet
+        _conv_packet = weewx.units.to_std_system(packet,
+                                                 self.stats_unit_system)
+        # update the buffer with the converted packet
+        self.buffer.add_packet(_conv_packet)
+        # obtain the message we are to publish
+        msg = self.generate_message(_conv_packet)
+        # connect to our mqtt broker
+        self.publisher.connect()
+        # publish to MQTT broker
+        self.publisher.publish(self.topic,
+                               json.dumps(msg),
+                               _conv_packet.get('dateTime', int(time.time())))
+
+    def generate_message(self, packet):
+        """Generate the message to be published."""
+
+        data = {'usUnits': packet['usUnits']}
+        # iterate over each of the keys in our input config, if that key is
+        # in the record then add the record field to our dict
+        for f in self.inputs.keys():
+            if f in packet:
+                data[f] = dict()
+                data[f]['now'] = packet[f]
+                aggs = weeutil.weeutil.option_as_list(self.inputs[f].get('agg', []))
+                if len(aggs) > 0:
+                    data[f]['today'] = dict()
+                    for agg in aggs:
+                        data[f]['today'][agg] = getattr(self.buffer[f], agg)
+        # return our data
+        return data
+
+    def get_nineam_rain(self, tstamp):
+        """Get the rainfall since 9am.
+
+        Given a timestamp get the rainfall from 9am before the timestamp
+        through until the timestamp.
+
+        Returns a value in the units used by the Buffer object. If the value
+        could not be calculated 0.0 is returned.
+        """
+
+        # First get a timestamp for the last 9am, but is it today or yesterday
+        # get datetime obj for the time of our packet
+        today_dt = datetime.datetime.fromtimestamp(tstamp)
+        # now get time obj for midnight
+        midnight_t = datetime.time(0)
+        # get datetime obj for midnight at start of today
+        midnight_dt = datetime.datetime.combine(today_dt, midnight_t)
+        # get the current hour
+        _h = int(time.strftime('%H', time.localtime(tstamp)))
+        # if it is after 9am add 9 hours to our
+        if _h >= 9:
+            # we want the timestamp at 9am today so add nine hours
+            nineam_dt = midnight_dt + datetime.timedelta(hours=9)
+        else:
+            # we want the timestamp at 9am yesterday so subtract 15 hours
+            nineam_dt = midnight_dt - datetime.timedelta(hours=15)
+        # get it as a timestamp
+        nineam_ts = time.mktime(nineam_dt.timetuple())
+        nineam_tspan = weeutil.weeutil.TimeSpan(nineam_ts, tstamp)
+        try:
+            rain_vt = weewx.xtypes.get_aggregate(obs_type='rain',
+                                                 timespan=nineam_tspan,
+                                                 aggregate_type='sum',
+                                                 db_manager=self.db_manager)
+        except (weewx.UnknownType,
+                weewx.UnknownAggregation,
+                weewx.CannotCalculate):
+            return 0.0
+        else:
+            return weewx.units.convertStd(rain_vt, self.stats_unit_system).value
+
+
+# ============================================================================
 #                          class MqttDashboardAeris
 # ============================================================================
 
-class MqttDashboardAeris(MQTTDashboardService):
+class MqttDashboardAeris(MqttDashboardService):
     """Service that publishes Aeris conditions and forecast data to a MQTT broker.
 
     The MqttDashboardAeris class creates and controls a threaded object of
@@ -1190,7 +1218,8 @@ class AerisAPI(object):
                     if response_json['success']:
                         return response_json
                     else:
-                        loginf("An error was encountered in the API response: %s" % (response_json['error']['description']))
+                        loginf("An error was encountered in the API "
+                               "response: %s" % (response_json['error']['description']))
                         request.close()
                         continue
             else:
@@ -1201,11 +1230,12 @@ class AerisAPI(object):
             # that endpoint, either way log it and return None
             logdbg("Invalid or unsupported endpoint '%s' provided" % (endpoint,))
 
+
 # ============================================================================
 #                             class MQTTDashboardSlow
 # ============================================================================
 
-class MqttDashboardSlow(MQTTDashboardService):
+class MqttDashboardSlow(MqttDashboardService):
     """Service that publishes slow changing JSON format data to an MQTT broker.
 
     The MQTTDashboardSlow class creates and controls a threaded object of class
@@ -2019,107 +2049,502 @@ class TLSDefaults(object):
 
 
 # ============================================================================
-#                               class DayCache
+#                      Supporting classes and functions
 # ============================================================================
 
-class DayCache(object):
-    """Dictionary of value-timestamp pairs.  Each timestamp indicates when the
-    corresponding value was last updated."""
 
-    def __init__(self):
-        self.unit_system = None
-        self.values = dict()
-        self.maximums = dict()
-        self.minimums = dict()
+# ============================================================================
+#                           class ObsBuffer
+# ============================================================================
 
-    def reset(self):
-        """Reset the maximums and minimums.
+class ObsBuffer(object):
+    """Base class to buffer an obs."""
 
-        To reset the maximums and minimums we simply reset self.maximums and
-        self.minimums to empty dicts.
+    def __init__(self, stats, units=None, history=False):
+        self.units = units
+        self.last = None
+        self.lasttime = None
+        if history:
+            self.use_history = True
+            self.history_full = False
+            self.history = []
+        else:
+            self.use_history = False
+
+    def add_value(self, val, ts, hilo=True):
+        """Add a value to my hilo and history stats as required."""
+
+        pass
+
+    def day_reset(self):
+        """Reset the vector obs buffer."""
+
+        pass
+
+    def trim_history(self, ts):
+        """Trim any old data from the history list."""
+
+        # calc ts of oldest sample we want to retain
+        oldest_ts = ts - MAX_AGE
+        # set history_full property
+        self.history_full = min([a.ts for a in self.history if a.ts is not None]) <= oldest_ts
+        # remove any values older than oldest_ts
+        self.history = [s for s in self.history if s.ts > oldest_ts]
+
+    def history_max(self, ts, age=MAX_AGE):
+        """Return the max value in my history.
+
+        Search the last age seconds of my history for the max value and the
+        corresponding timestamp.
+
+        Inputs:
+            ts:  the timestamp to start searching back from
+            age: the max age of the records being searched
+
+        Returns:
+            An object of type ObsTuple where value is a 3 way tuple of
+            (value, x component, y component) and ts is the timestamp when
+            it occurred.
         """
 
-        self.maximums = dict()
-        self.minimums = dict()
+        born = ts - age
+        snapshot = [a for a in self.history if a.ts >= born]
+        if len(snapshot) > 0:
+            _max = max(snapshot, key=itemgetter(1))
+            return ObsTuple(_max[0], _max[1])
+        else:
+            return None
 
-    def update(self, packet, ts):
-        # update the cache with values from the specified packet, using the
-        # specified timestamp.
-        for k in packet:
-            if k is None:
-                # well-formed packets do not have None as key, but just in case
-                continue
-            elif k == 'dateTime':
-                # do not cache the timestamp
-                continue
-            elif k == 'usUnits':
-                # assume unit system of first packet, then enforce consistency
-                if self.unit_system is None:
-                    self.unit_system = packet[k]
-                elif packet[k] is None:
-                    raise ValueError("Invalid unit system encountered in cache: 'usUnits'=%s"
-                                     % (packet[k],))
-                elif packet[k] != self.unit_system:
-                    raise ValueError("Mixed units encountered in cache. %s vs %s"
-                                     % (self.unit_system, packet[k]))
+    def history_avg(self, ts, age=MAX_AGE):
+        """Return the average value in my history.
+
+        Search the last age seconds of my history for the max value and the
+        corresponding timestamp.
+
+        Inputs:
+            ts:  the timestamp to start searching back from
+            age: the max age of the records being searched
+
+        Returns:
+            An object of type ObsTuple where value is a 3 way tuple of
+            (value, x component, y component) and ts is the timestamp when
+            it occurred.
+        """
+
+        born = ts - age
+        snapshot = [a.value for a in self.history if a.ts >= born]
+        if len(snapshot) > 0:
+            return float(sum(snapshot)/len(snapshot))
+        else:
+            return None
+
+
+# ============================================================================
+#                             class VectorBuffer
+# ============================================================================
+
+class VectorBuffer(ObsBuffer):
+    """Class to buffer vector obs."""
+
+    default_init = (None, None, None, None, None, 0.0, 0.0, 0.0, 0.0, 0)
+
+    def __init__(self, stats, units=None, history=False):
+        # initialize my superclass
+        super(VectorBuffer, self).__init__(stats, units=units, history=history)
+
+        if stats:
+            self.min = stats.min
+            self.mintime = stats.mintime
+            self.max = stats.max
+            self.max_dir = stats.max_dir
+            self.maxtime = stats.maxtime
+            self.sum = stats.sum
+            self.xsum = stats.xsum
+            self.ysum = stats.ysum
+            self.sumtime = stats.sumtime
+            self.count = stats.count
+            self.nineam_sum = 0.0
+        else:
+            (self.min, self.mintime,
+             self.max, self.max_dir,
+             self.maxtime, self.sum,
+             self.xsum, self.ysum,
+             self.sumtime, self.count) = VectorBuffer.default_init
+            self.nineam_sum = 0.0
+
+    def add_value(self, val, ts, hilo=True):
+        """Add a value to my hilo and history stats as required."""
+
+        if val.mag is not None:
+            if hilo:
+                if self.min is None or val.mag < self.min:
+                    self.min = val.mag
+                    self.mintime = ts
+                if self.max is None or val.mag > self.max:
+                    self.max = val.mag
+                    self.max_dir = val.dir
+                    self.maxtime = ts
+            self.sum += val.mag
+            if self.lasttime:
+                self.sumtime += ts - self.lasttime
+            if val.dir is not None:
+                self.xsum += val.mag * math.cos(math.radians(90.0 - val.dir))
+                self.ysum += val.mag * math.sin(math.radians(90.0 - val.dir))
+            if self.lasttime is None or ts >= self.lasttime:
+                self.last = val
+                self.lasttime = ts
+            self.count += 1
+            if self.use_history and val.dir is not None:
+                self.history.append(ObsTuple(val, ts))
+                self.trim_history(ts)
+
+    def day_reset(self):
+        """Reset the vector obs buffer."""
+
+        (self.min, self.mintime,
+         self.max, self.max_dir,
+         self.maxtime, self.sum,
+         self.xsum, self.ysum,
+         self.sumtime, self.count) = VectorBuffer.default_init
+
+    def nineam_reset(self):
+        """Reset the vector obs buffer."""
+
+        self.nineam_sum = 0.0
+
+    @property
+    def day_vec_avg(self):
+        """The day average vector."""
+
+        try:
+            _magnitude = math.sqrt((self.xsum**2 + self.ysum**2) / self.sumtime**2)
+        except ZeroDivisionError:
+            return VectorTuple(0.0, 0.0)
+        _direction = 90.0 - math.degrees(math.atan2(self.ysum, self.xsum))
+        _direction = _direction if _direction >= 0.0 else _direction + 360.0
+        return VectorTuple(_magnitude, _direction)
+
+    @property
+    def history_vec_avg(self):
+        """The history average vector.
+
+        The period over which the average is calculated is the the history
+        retention period (nominally 10 minutes).
+        """
+
+        # TODO. Check the maths here, time ?
+        result = VectorTuple(None, None)
+        if self.use_history and len(self.history) > 0:
+            xy = [(ob.value.mag * math.cos(math.radians(90.0 - ob.value.dir)),
+                   ob.value.mag * math.sin(math.radians(90.0 - ob.value.dir))) for ob in self.history]
+            xsum = sum(x for x, y in xy)
+            ysum = sum(y for x, y in xy)
+            oldest_ts = min(ob.ts for ob in self.history)
+            _magnitude = math.sqrt((xsum**2 + ysum**2) / (time.time() - oldest_ts)**2)
+            _direction = 90.0 - math.degrees(math.atan2(ysum, xsum))
+            _direction = _direction if _direction >= 0.0 else _direction + 360.0
+            result = VectorTuple(_magnitude, _direction)
+        return result
+
+    @property
+    def history_vec_dir(self):
+        """The history vector average direction.
+
+        The period over which the average is calculated is the the history
+        retention period (nominally 10 minutes).
+        """
+
+        result = None
+        if self.use_history and len(self.history) > 0:
+            xy = [(ob.value.mag * math.cos(math.radians(90.0 - ob.value.dir)),
+                   ob.value.mag * math.sin(math.radians(90.0 - ob.value.dir))) for ob in self.history]
+            xsum = sum(x for x, y in xy)
+            ysum = sum(y for x, y in xy)
+            _direction = 90.0 - math.degrees(math.atan2(ysum, xsum))
+            result = _direction if _direction >= 0.0 else _direction + 360.0
+        return result
+
+
+# ============================================================================
+#                             class ScalarBuffer
+# ============================================================================
+
+class ScalarBuffer(ObsBuffer):
+    """Class to buffer scalar obs."""
+
+    default_init = (None, None, None, None, 0.0, 0)
+
+    def __init__(self, stats, units=None, history=False):
+        # initialize my superclass
+        super(ScalarBuffer, self).__init__(stats, units=units, history=history)
+
+        if stats:
+            self.min = stats.min
+            self.mintime = stats.mintime
+            self.max = stats.max
+            self.maxtime = stats.maxtime
+            self.sum = stats.sum
+            self.count = stats.count
+            self.nineam_sum = 0.0
+        else:
+            (self.min, self.mintime,
+             self.max, self.maxtime,
+             self.sum, self.count) = ScalarBuffer.default_init
+            self.nineam_sum = 0.0
+
+    def add_value(self, val, ts, hilo=True):
+        """Add a value to my stats as required."""
+
+        if val is not None:
+            if hilo:
+                if self.min is None or val < self.min:
+                    self.min = val
+                    self.mintime = ts
+                if self.max is None or val > self.max:
+                    self.max = val
+                    self.maxtime = ts
+            self.sum += val
+            if self.lasttime is None or ts >= self.lasttime:
+                self.last = val
+                self.lasttime = ts
+            self.count += 1
+            if self.use_history:
+                self.history.append(ObsTuple(val, ts))
+                self.trim_history(ts)
+
+    def day_reset(self):
+        """Reset the scalar obs buffer."""
+
+        (self.min, self.mintime,
+         self.max, self.maxtime,
+         self.sum, self.count) = ScalarBuffer.default_init
+
+    def nineam_reset(self):
+        """Reset the scalar obs buffer."""
+
+        self.nineam_sum = 0.0
+
+
+# ============================================================================
+#                               class Buffer
+# ============================================================================
+
+class Buffer(dict):
+    """Class to buffer various loop packet obs.
+
+    If archive based stats are an efficient means of getting stats for today.
+    However, their use would mean that any daily stat (eg today's max outTemp)
+    that 'occurs' after the most recent archive record but before the next
+    archive record is written to archive will not be captured. For this reason
+    selected loop data is buffered to ensure that such stats are correctly
+    reflected.
+    """
+
+    def __init__(self, manifest, day_stats, additional_day_stats=None):
+        """Initialise an instance of our class."""
+
+        self.manifest = manifest
+        # seed our buffer objects from day_stats
+        for obs in [f for f in day_stats if f in self.manifest]:
+            seed_func = seed_functions.get(obs, Buffer.seed_scalar)
+            seed_func(self, day_stats, obs, history=obs in HIST_MANIFEST)
+        # seed our buffer objects from additional_day_stats
+        if additional_day_stats:
+            for obs in [f for f in additional_day_stats if f in self.manifest]:
+                if obs not in self:
+                    seed_func = seed_functions.get(obs, Buffer.seed_scalar)
+                    seed_func(self, additional_day_stats, obs,
+                              history=obs in HIST_MANIFEST)
+        # timestamp of the last packet containing windSpeed, used for windrun
+        # calcs
+        self.last_windSpeed_ts = None
+
+    def seed_scalar(self, stats, obs_type, history):
+        """Seed a scalar buffer."""
+
+        self[obs_type] = init_dict.get(obs_type, ScalarBuffer)(stats=stats[obs_type],
+                                                               units=stats.unit_system,
+                                                               history=history)
+
+    def seed_vector(self, stats, obs_type, history):
+        """Seed a vector buffer."""
+
+        self[obs_type] = init_dict.get(obs_type, VectorBuffer)(stats=stats[obs_type],
+                                                               units=stats.unit_system,
+                                                               history=history)
+
+    def add_packet(self, packet):
+        """Add a packet to the buffer."""
+
+        if packet['dateTime'] is not None:
+            for obs in [f for f in packet if f in self.manifest]:
+                add_func = add_functions.get(obs, Buffer.add_value)
+                add_func(self, packet, obs)
+
+    def add_value(self, packet, obs):
+        """Add a value to the buffer."""
+
+        # if we haven't seen this obs before add it to our buffer
+        if obs not in self:
+            self[obs] = init_dict.get(obs, ScalarBuffer)(stats=None,
+                                                         units=packet['usUnits'],
+                                                         history=obs in HIST_MANIFEST)
+        if self[obs].units == packet['usUnits']:
+            _value = packet[obs]
+        else:
+            (unit, group) = weewx.units.getStandardUnitType(packet['usUnits'],
+                                                            obs)
+            _vt = ValueTuple(packet[obs], unit, group)
+            _value = weewx.units.convertStd(_vt, self[obs].units).value
+        self[obs].add_value(_value, packet['dateTime'])
+
+    def add_wind_value(self, packet, obs):
+        """Add a wind value to the buffer."""
+
+        # first add it as a scalar
+        self.add_value(packet, obs)
+
+        # if there is no windrun in the packet and if obs is windSpeed then we
+        # can use windSpeed to update windrun
+        if 'windrun' not in packet and obs == 'windSpeed':
+            # has windrun been seen before, if not add it to the Buffer
+            if 'windrun' not in self:
+                self['windrun'] = init_dict.get(obs, ScalarBuffer)(stats=None,
+                                                                   units=packet['usUnits'],
+                                                                   history=obs in HIST_MANIFEST)
+            # to calculate windrun we need a speed over a period of time, are
+            # we able to calculate the length of the time period?
+            if self.last_windSpeed_ts is not None:
+                windrun = self.calc_windrun(packet)
+                self['windrun'].add_value(windrun, packet['dateTime'])
+            self.last_windSpeed_ts = packet['dateTime']
+
+        # now add it as the special vector 'wind'
+        if obs == 'windSpeed':
+            if 'wind' not in self:
+                self['wind'] = VectorBuffer(stats=None, units=packet['usUnits'])
+            if self['wind'].units == packet['usUnits']:
+                _value = packet['windSpeed']
             else:
-                # cache each value, associating it with the time it was cached
-                self.values[k] = {'value': packet[k], 'ts': ts}
-                if packet[k] is not None:
-                    if k not in self.maximums or ('max' in self.maximums[k] and packet[k] > self.maximums[k]['max']):
-                        self.maximums[k] = {'max': packet[k], 'max_ts': ts}
-                    if k not in self.minimums or ('min' in self.minimums[k] and packet[k] < self.minimums[k]['min']):
-                        self.minimums[k] = {'min': packet[k], 'min_ts': ts}
+                (unit, group) = weewx.units.getStandardUnitType(packet['usUnits'],
+                                                                'windSpeed')
+                _vt = ValueTuple(packet['windSpeed'], unit, group)
+                _value = weewx.units.convertStd(_vt, self['wind'].units).value
+            self['wind'].add_value(VectorTuple(_value, packet.get('windDir')),
+                                   packet['dateTime'])
 
-    def get_value(self, k, ts, stale_age):
-        """Get a value for a given key from the cache.
+    def start_of_day_reset(self):
+        """Reset our buffer stats at the end of an archive period.
 
-        Get the value for the specified key. If the value is older than
-        stale_age (seconds) then return None.
+        Reset our hi/lo data but don't touch the history, it might need to be
+        kept longer than the end of the archive period.
         """
 
-        if k in self.values and ts - self.values[k]['ts'] < stale_age:
-            return self.values[k]['value']
-        return None
+        for obs in self.manifest:
+            self[obs].day_reset()
 
-    def get_maximum(self, k):
-        """Get the maximum for a given observation.
+    def nineam_reset(self):
+        """Reset our buffer stats at the end of an archive period.
 
-        Get the maximum value and timestamp the value was seen for the
-        specified key. If the key does not exist return None.
+        Reset our hi/lo data but don't touch the history, it might need to be
+        kept longer than the end of the archive period.
         """
 
-        return self.maximums.get(k, {'max': None, 'max_ts': None})
+        for obs in SUM_MANIFEST:
+            self[obs].nineam_reset()
 
-    def get_minimum(self, k):
-        """Get the minimum for a given observation.
+    def calc_windrun(self, packet):
+        """Calculate windrun given windSpeed."""
 
-        Get the minimum value and timestamp the value was seen for the
-        specified key. If the key does not exist return None.
-        """
+        val = None
+        if packet['usUnits'] == weewx.US:
+            val = packet['windSpeed'] * (packet['dateTime'] - self.last_windSpeed_ts) / 3600.0
+            unit = 'mile'
+        elif packet['usUnits'] == weewx.METRIC:
+            val = packet['windSpeed'] * (packet['dateTime'] - self.last_windSpeed_ts) / 3600.0
+            unit = 'km'
+        elif packet['usUnits'] == weewx.METRICWX:
+            val = packet['windSpeed'] * (packet['dateTime'] - self.last_windSpeed_ts)
+            unit = 'meter'
+        if self['windrun'].units == packet['usUnits']:
+            return val
+        else:
+            _vt = ValueTuple(val, unit, 'group_distance')
+            return weewx.units.convertStd(_vt, self['windrun'].units).value
 
-        return self.minimums.get(k, {'min': None, 'min_ts': None})
 
-    def get_max_min_packet(self, ts=None, stale_age=960):
-        """Get a cached packet that includes max/min values and timestamps."""
+# ============================================================================
+#                   Class Buffer configuration dictionaries
+# ============================================================================
 
-        if ts is None:
-            ts = int(time.time() + 0.5)
-        pkt = {'dateTime': ts, 'usUnits': self.unit_system}
-        for k in self.values:
-            pkt[k] = dict()
-            pkt[k]['now'] = self.get_value(k, ts, stale_age)
-            pkt[k]['today'] = self.get_maximum(k)
-            pkt[k]['today'].update(self.get_minimum(k))
-        return pkt
+init_dict = weewx.units.ListOfDicts({'wind': VectorBuffer})
+add_functions = weewx.units.ListOfDicts({'windSpeed': Buffer.add_wind_value})
+seed_functions = weewx.units.ListOfDicts({'wind': Buffer.seed_vector})
 
-    def get_packet(self, ts=None, stale_age=960):
-        if ts is None:
-            ts = int(time.time() + 0.5)
-        pkt = {'dateTime': ts, 'usUnits': self.unit_system}
-        for k in self.values:
-            pkt[k] = self.get_value(k, ts, stale_age)
-        return pkt
+
+# ============================================================================
+#                              class ObsTuple
+# ============================================================================
+
+class ObsTuple(tuple):
+    """Class supporting timestamped observations.
+
+    An observation during some period can be represented by the value of the
+    observation and the time at which it was observed. This can be represented
+    in a two way tuple called an obs tuple. An obs tuple is useful because its
+    contents can be accessed using named attributes.
+
+    Item   attribute   Meaning
+     0     value       The observed value eg 19.5
+     1     ts          The epoch timestamp that the value was observed
+                       eg 1488245400
+
+    It is valid to have an observed value of None.
+
+    It is also valid to have a ts of None (meaning there is no information
+    about the time the was was observed.
+    """
+
+    def __new__(cls, *args):
+        return tuple.__new__(cls, args)
+
+    @property
+    def value(self):
+        return self[0]
+
+    @property
+    def ts(self):
+        return self[1]
+
+
+# ============================================================================
+#                              class VectorTuple
+# ============================================================================
+
+class VectorTuple(tuple):
+    """Class representing a vector observation.
+
+    A vector value can be represented as a magnitude and direction. This can be
+    represented in a 2 way tuple called an vector tuple. A vector tuple is
+    useful because its contents can be accessed using named attributes.
+
+    Item   attribute   Meaning
+     0     mag         The magnitude of the vector
+     1     dir         The direction of the vector in degrees
+
+    mag and dir may be None.
+    """
+
+    def __new__(cls, *args):
+        return tuple.__new__(cls, args)
+
+    @property
+    def mag(self):
+        return self[0]
+
+    @property
+    def dir(self):
+        return self[1]
 
 
 # ============================================================================
