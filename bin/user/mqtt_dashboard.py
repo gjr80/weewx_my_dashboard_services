@@ -2104,7 +2104,8 @@ class ObsBuffer(object):
         # remove any values older than oldest_ts
         self.history = [s for s in self.history if s.ts > oldest_ts]
 
-    def history_max(self, ts, age=MAX_AGE):
+    @property
+    def hist_max(self, ts, age=MAX_AGE):
         """Return the max value in my history.
 
         Search the last age seconds of my history for the max value and the
@@ -2128,7 +2129,8 @@ class ObsBuffer(object):
         else:
             return None
 
-    def history_avg(self, ts, age=MAX_AGE):
+    @property
+    def hist_avg(self, ts, age=MAX_AGE):
         """Return the average value in my history.
 
         Search the last age seconds of my history for the max value and the
@@ -2239,7 +2241,7 @@ class VectorBuffer(ObsBuffer):
         return VectorTuple(_magnitude, _direction)
 
     @property
-    def history_vec_avg(self):
+    def hist_vec_avg(self):
         """The history average vector.
 
         The period over which the average is calculated is the the history
@@ -2261,7 +2263,7 @@ class VectorBuffer(ObsBuffer):
         return result
 
     @property
-    def history_vec_dir(self):
+    def hist_vec_dir(self):
         """The history vector average direction.
 
         The period over which the average is calculated is the the history
