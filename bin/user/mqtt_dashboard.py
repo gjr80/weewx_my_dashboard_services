@@ -2198,6 +2198,7 @@ class VectorBuffer(ObsBuffer):
                     self.max_dir = val.dir
                     self.maxtime = ts
             self.sum += val.mag
+            self.nineam_sum += val.mag
             if self.lasttime:
                 self.sumtime += ts - self.lasttime
             if val.dir is not None:
@@ -2317,6 +2318,7 @@ class ScalarBuffer(ObsBuffer):
                     self.max = val
                     self.maxtime = ts
             self.sum += val
+            self.nineam_sum += val
             if self.lasttime is None or ts >= self.lasttime:
                 self.last = val
                 self.lasttime = ts
