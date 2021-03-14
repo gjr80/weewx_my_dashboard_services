@@ -483,11 +483,15 @@ class MqttDashboardRealtimeThread(threading.Thread):
     def generate_message(self, packet):
         """Generate the message to be published."""
 
-        data = {'usUnits': packet['usUnits']}
+        data = {'dateTime': packet['dateTime'],
+                'usUnits': packet['usUnits']}
         # iterate over each of the keys in our input config, if that key is
-        # in the record then add the record field to our dict
+        # in the record then add the record field to our dict, if the key is
+        # not see if there is anything in our buffer we can use
         for f in self.inputs.keys():
             if f in packet:
+                if f == 'dateTime':
+                    continue
                 data[f] = dict()
                 data[f]['now'] = packet[f]
                 aggs = weeutil.weeutil.option_as_list(self.inputs[f].get('agg', []))
@@ -495,6 +499,15 @@ class MqttDashboardRealtimeThread(threading.Thread):
                     data[f]['today'] = dict()
                     for agg in aggs:
                         data[f]['today'][agg] = getattr(self.buffer[f], agg)
+            elif f in self.buffer:
+                aggs = weeutil.weeutil.option_as_list(self.inputs[f].get('agg', []))
+                if len(aggs) > 0:
+                    data[f] = dict()
+                    data[f]['today'] = dict()
+                    for agg in aggs:
+                        data[f]['today'][agg] = getattr(self.buffer[f], agg)
+
+
         # return our data
         return data
 
