@@ -361,7 +361,7 @@ class MqttDashboardRealtimeThread(threading.Thread):
         # TimeSpan for the current day
         self.day_span = None
         # is it a new day, used for 9am resets
-        self.new_day = True
+        self.new_day = False
         # db manager
         self.db_manager = None
         # stats unit system
@@ -1384,12 +1384,18 @@ class MqttDashboardSlowThread(threading.Thread):
         self.queue = queue
         self.config_dict = config_dict
 
-        # various dicts used later with converters and formatters
-        self.group_dict = slow_config_dict.get('Groups', weewx.units.MetricUnits)
-        self.format_dict = slow_config_dict.get('Formats',
-                                                weewx.units.default_unit_format_dict)
+
         self.moonphases = slow_config_dict.get('Almanac', {}).get('moon_phases',
                                                                   weeutil.Moon.moon_phases)
+
+        # get a unit converter
+        # first get the unit nickname ('US', 'METRIC' or 'METRICWX') we are to use,
+        # default to 'METRIC'
+        target_unit_nickname = slow_config_dict.get('target_unit', 'METRIC')
+        # now translate that to a WeeWX unit system
+        self.target_unit = weewx.units.unit_constants[target_unit_nickname.upper()]
+        # now bind self.converter to the appropriate standard converter
+        self.converter = weewx.units.StdUnitConverters[self.target_unit]
 
         # get MQTT config options
         server_url = mqtt_config_dict.get('server_url', None)
@@ -1428,8 +1434,6 @@ class MqttDashboardSlowThread(threading.Thread):
         self.additional_manager = None
         self.stats = None
         self.db_binder = None
-        self.converter = None
-        self.formatter = None
         self.almanac = None
 
     def run(self):
@@ -1445,10 +1449,6 @@ class MqttDashboardSlowThread(threading.Thread):
 
         # get a DBBinder object
         self.db_binder = weewx.manager.DBBinder(self.config_dict)
-
-        # get Converter and Formatter objects to convert/format our data
-        self.converter = weewx.units.Converter(self.group_dict)
-        self.formatter = weewx.units.Formatter(unit_format_dict=self.format_dict)
 
         # Run a continuous loop, processing data received in the queue. Only
         # break out if we receive the shutdown signal (None) from our parent.
@@ -1498,7 +1498,6 @@ class MqttDashboardSlowThread(threading.Thread):
             self.stats = weewx.tags.TimeBinder(db_lookup,
                                                record['dateTime'],
                                                converter=self.converter,
-                                               formatter=self.formatter,
                                                trend=trend_dict)
             temperature_c = record.get('outTemp', 15.0)
             pressure_mbar = record.get('barometer', 1010.0)
@@ -1508,8 +1507,7 @@ class MqttDashboardSlowThread(threading.Thread):
                                                  altitude=self.altitude_m,
                                                  temperature=temperature_c,
                                                  pressure=pressure_mbar,
-                                                 moon_phases=self.moonphases,
-                                                 formatter=self.formatter)
+                                                 moon_phases=self.moonphases)
             # get a data dict from which to construct our JSON data
             data = self.calculate(record)
             # connect to the mqtt broker
@@ -1517,7 +1515,7 @@ class MqttDashboardSlowThread(threading.Thread):
             # publish the data
             self.publisher.publish(self.topic,
                                    json.dumps(data),
-                                   data['dateTime']['now'])
+                                   data['dateTime'])
             # log the time taken to process this record
             logdbg("Record (%s) processed in %.5f seconds" % (record['dateTime'],
                                                               (time.time()-t1)))
@@ -1547,45 +1545,42 @@ class MqttDashboardSlowThread(threading.Thread):
         # initialise our result containing dict
         data = {}
 
-        # Add dateTime fields
-        datetime = dict()
-        # now
-        datetime['now'] = ts
-        # add dateTime fields to our data
-        data['dateTime'] = datetime
+        # add dateTime and usUnits
+        data['dateTime'] = ts
+        data['usUnits'] = self.target_unit
 
         # Add outTemp fields
         outtemp = dict()
         # yesterday
         outtemp['yest'] = dict()
-        outtemp['yest']['min'] = to_float(self.stats.yesterday().outTemp.min.formatted)
+        outtemp['yest']['min'] = to_float(self.stats.yesterday().outTemp.min.raw)
         outtemp['yest']['min_ts'] = self.stats.yesterday().outTemp.mintime.raw
-        outtemp['yest']['max'] = to_float(self.stats.yesterday().outTemp.max.formatted)
+        outtemp['yest']['max'] = to_float(self.stats.yesterday().outTemp.max.raw)
         outtemp['yest']['max_ts'] = self.stats.yesterday().outTemp.maxtime.raw
         # trend
-        outtemp['trend'] = to_float(self.stats.trend(time_delta=3600).outTemp.formatted)
-        outtemp['24h_trend'] = to_float(self.stats.trend(time_delta=86400).outTemp.formatted)
+        outtemp['trend'] = to_float(self.stats.trend(time_delta=3600).outTemp.raw)
+        outtemp['24h_trend'] = to_float(self.stats.trend(time_delta=86400).outTemp.raw)
         # add outTemp fields to our data
         data['outTemp'] = outtemp
 
         # Add barometer fields
         barometer = dict()
         # trend
-        barometer['trend'] = to_float(self.stats.trend(time_delta=10800).barometer.formatted)
+        barometer['trend'] = to_float(self.stats.trend(time_delta=10800).barometer.raw)
         # add barometer fields to our data
         data['barometer'] = barometer
 
         # Add dewpoint fields
         dewpoint = dict()
         # trend
-        dewpoint['trend'] = to_float(self.stats.trend(time_delta=3600).dewpoint.formatted)
+        dewpoint['trend'] = to_float(self.stats.trend(time_delta=3600).dewpoint.raw)
         # add dewpoint fields to our data
         data['dewpoint'] = dewpoint
 
         # Add outHumidity fields
         outhumidity = dict()
         # trend
-        outhumidity['trend'] = to_float(self.stats.trend(time_delta=3600).outHumidity.formatted)
+        outhumidity['trend'] = to_float(self.stats.trend(time_delta=3600).outHumidity.raw)
         # add outHumidity fields to our data
         data['outHumidity'] = outhumidity
 
@@ -1595,18 +1590,18 @@ class MqttDashboardSlowThread(threading.Thread):
         wind['windGust'] = dict()
         # yesterday
         wind['windGust']['yest'] = dict()
-        wind['windGust']['yest']['max'] = to_float(self.stats.yesterday().windGust.max.formatted)
+        wind['windGust']['yest']['max'] = to_float(self.stats.yesterday().windGust.max.raw)
         wind['windGust']['yest']['max_ts'] = self.stats.yesterday().windGust.maxtime.raw
         # windrun
         wind['windrun'] = dict()
         if self.stats.yesterday().windrun.exists:
-            _run = to_float(self.stats.yesterday().windrun.sum.formatted)
+            _run = to_float(self.stats.yesterday().windrun.sum.raw)
         else:
             try:
                 _run_km = self.stats.yesterday().windSpeed.avg.km_per_hour.raw * 24
                 _run_vt = ValueTuple(_run_km, 'km', 'group_distance')
-                _run_c = self.converter.convert(_run_vt)
-                _run = to_float(self.formatter.toString(_run_c, addLabel=False))
+                _run = self.converter.convert(_run_vt).value
+#                _run = to_float(self.formatter.toString(_run_c, addLabel=False))
             except TypeError:
                 _run = None
         wind['windrun']['yest'] = _run
@@ -1616,11 +1611,11 @@ class MqttDashboardSlowThread(threading.Thread):
         # Add rain fields
         rain = dict()
         # yesterday
-        rain['yest'] = to_float(self.stats.yesterday().rain.sum.formatted)
+        rain['yest'] = to_float(self.stats.yesterday().rain.sum.raw)
         # month to date
-        rain['mtd'] = to_float(self.stats.month().rain.sum.formatted)
+        rain['mtd'] = to_float(self.stats.month().rain.sum.raw)
         # year to date
-        rain['ytd'] = to_float(self.stats.year().rain.sum.formatted)
+        rain['ytd'] = to_float(self.stats.year().rain.sum.raw)
         # add rain fields to our data
         data['rain'] = rain
 
@@ -1628,7 +1623,7 @@ class MqttDashboardSlowThread(threading.Thread):
         radiation = dict()
         # yesterday
         radiation['yest'] = dict()
-        radiation['yest']['max'] = to_float(self.stats.yesterday().radiation.max.formatted)
+        radiation['yest']['max'] = to_float(self.stats.yesterday().radiation.max.raw)
         radiation['yest']['max_ts'] = self.stats.yesterday().radiation.maxtime.raw
         # add radiation fields to our data
         data['radiation'] = radiation
@@ -1637,7 +1632,7 @@ class MqttDashboardSlowThread(threading.Thread):
         uv = dict()
         # yesterday
         uv['yest'] = dict()
-        uv['yest']['max'] = to_float(self.stats.yesterday().UV.max.formatted)
+        uv['yest']['max'] = to_float(self.stats.yesterday().UV.max.raw)
         uv['yest']['max_ts'] = self.stats.yesterday().UV.maxtime.raw
         # add UV fields to our data
         data['UV'] = uv
