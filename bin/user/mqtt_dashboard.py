@@ -151,6 +151,11 @@ except ImportError:
 
 # length of history to be maintained in seconds
 MAX_AGE = 600
+# list of obs that we will attempt to buffer
+MANIFEST = ['outTemp', 'barometer', 'outHumidity', 'rain', 'rainRate',
+            'humidex', 'windchill', 'heatindex', 'windSpeed', 'inTemp',
+            'appTemp', 'dewpoint', 'windDir', 'UV', 'radiation', 'wind',
+            'windGust', 'windGustDir', 'windrun']
 # obs for which we need a running sum
 SUM_MANIFEST = ['rain']
 # obs for which we need a history
@@ -311,14 +316,6 @@ class MqttDashboardRealtime(MqttDashboardService):
 class MqttDashboardRealtimeThread(threading.Thread):
     """Thread to publish loop based data to a MQTT broker."""
 
-    # list of obs that we will attempt to buffer
-    MANIFEST = ['outTemp', 'barometer', 'outHumidity', 'rain', 'rainRate',
-                'humidex', 'windchill', 'heatindex', 'windSpeed', 'inTemp',
-                'appTemp', 'dewpoint', 'windDir', 'UV', 'radiation', 'wind',
-                'windGust', 'windGustDir', 'windrun']
-
-
-
     def __init__(self, queue, rt_config_dict, mqtt_config_dict, manager_dict):
 
         # Initialize my superclass
@@ -382,8 +379,7 @@ class MqttDashboardRealtimeThread(threading.Thread):
         # save our day stats unit system for use later
         self.stats_unit_system = day_stats.unit_system
         # get a Buffer object
-        self.buffer = Buffer(MqttDashboardRealtimeThread.MANIFEST,
-                             day_stats=day_stats)
+        self.buffer = Buffer(MANIFEST, day_stats=day_stats)
         # wrap our main processing loop in a try..except, if any exceptions are
         # raised we want to be able to capture them and provide feedback rather
         # than the thread just silently dying
@@ -490,23 +486,50 @@ class MqttDashboardRealtimeThread(threading.Thread):
         # not see if there is anything in our buffer we can use
         for f in self.inputs.keys():
             if f in packet:
+                # don't add dateTime, it's already there and is mandatory anyway
                 if f == 'dateTime':
                     continue
-                data[f] = dict()
-                data[f]['now'] = packet[f]
+                # add the current (or now) value unless we have been explicitly
+                # told not to
+                if to_bool(self.inputs[f].get('now', True)):
+                    # add a field placeholder in our data dict
+                    data[f] = dict()
+                    # and add the current value
+                    data[f]['now'] = packet[f]
+                # now handle any aggregates
                 aggs = weeutil.weeutil.option_as_list(self.inputs[f].get('agg', []))
                 if len(aggs) > 0:
+                    # add a field placeholder in our data dict if we have not
+                    # already done so
+                    if f not in data:
+                        data[f] = dict()
+                    # add a placeholder for our aggregates
                     data[f]['today'] = dict()
+                    # and add each aggregate
                     for agg in aggs:
-                        data[f]['today'][agg] = getattr(self.buffer[f], agg)
+                        # wrap in a try..except in case we find an aggregate we
+                        # don't know about
+                        try:
+                            data[f]['today'][agg] = getattr(self.buffer[f], agg)
+                        except AttributeError:
+                            # we couldn't find that attribute so skip it
+                            pass
             elif f in self.buffer:
                 aggs = weeutil.weeutil.option_as_list(self.inputs[f].get('agg', []))
                 if len(aggs) > 0:
+                    # add a field placeholder in our data dict
                     data[f] = dict()
+                    # add a placeholder for our aggregates
                     data[f]['today'] = dict()
+                    # and add each aggregate
                     for agg in aggs:
-                        data[f]['today'][agg] = getattr(self.buffer[f], agg)
-
+                        # wrap in a try..except in case we find an aggregate we
+                        # don't know about
+                        try:
+                            data[f]['today'][agg] = getattr(self.buffer[f], agg)
+                        except AttributeError:
+                            # we couldn't find that attribute so skip it
+                            pass
 
         # return our data
         return data
