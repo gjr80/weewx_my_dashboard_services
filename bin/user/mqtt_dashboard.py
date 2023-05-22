@@ -341,6 +341,7 @@ class MqttDashboardRealtimeThread(threading.Thread):
         retain = to_bool(mqtt_config_dict.get('retain', True))
         # log successful publishing of data
         log_success = to_bool(mqtt_config_dict.get('log_success', False))
+        mqtt_debug = to_int(mqtt_config_dict.get('mqtt_debug', 0))
 
         # the fields we are to include in our output
         self.inputs = rt_config_dict.get('inputs', {})
@@ -355,7 +356,8 @@ class MqttDashboardRealtimeThread(threading.Thread):
                                        tls=tls_opt,
                                        retain=retain,
                                        qos=qos,
-                                       log_success=log_success)
+                                       log_success=log_success,
+                                       mqtt_debug=mqtt_debug)
 
         # initialise some properties we will use
         # TimeSpan for the current day
@@ -890,6 +892,8 @@ class MqttDashboardAerisThread(threading.Thread):
         retain = to_bool(mqtt_config_dict.get('retain', True))
         # log successful publishing of data
         log_success = to_bool(mqtt_config_dict.get('log_success', False))
+        mqtt_debug = to_int(mqtt_config_dict.get('mqtt_debug', 0))
+        mqtt_debug = to_int(mqtt_config_dict.get('mqtt_debug', 0))
 
         # do our config logging before the Publisher
         loginf("Data will be published to %s" % obfuscate_password(server_url))
@@ -902,7 +906,8 @@ class MqttDashboardAerisThread(threading.Thread):
                                        tls=tls_opt,
                                        retain=retain,
                                        qos=qos,
-                                       log_success=log_success)
+                                       log_success=log_success,
+                                       mqtt_debug=mqtt_debug)
 
         # list of the Aeris API 'endpoints' to be used
 #        self.endpoints = ['observations', 'forecasts']
