@@ -1797,20 +1797,20 @@ class MqttPublisher(object):
                     self.mqtt_client.reconnect()
                 except (socket.error, socket.timeout, socket.herror) as e:
                     loginf("socket error: %s" % (e,))
+#                else:
+                # was the reconnect successful
+                if self.mqtt_client.connected:
+                    # start the client loop
+                    self.mqtt_client.loop_start()
                 else:
-                    # was the reconnect successful
-                    if self.mqtt_client.connected:
-                        # start the client loop
-                        self.mqtt_client.loop_start()
-                    else:
-                        # Could not reconnect, perhaps the broker has restarted.
-                        # Get a new client
-                        if weewx.debug >= 3 or self.mqtt_debug > 0:
-                            loginf("Could not reconnect to MQTT broker, creating new client...")
-                        # get a new client
-                        self.mqtt_client = self.get_client()
-                        if weewx.debug >= 3 or self.mqtt_debug > 0:
-                            loginf("New MQTT client created")
+                    # Could not reconnect, perhaps the broker has restarted.
+                    # Get a new client
+                    if weewx.debug >= 3 or self.mqtt_debug > 0:
+                        loginf("Could not reconnect to MQTT broker, creating new client...")
+                    # get a new client
+                    self.mqtt_client = self.get_client()
+                    if weewx.debug >= 3 or self.mqtt_debug > 0:
+                        loginf("New MQTT client created")
         else:
             # we don't have a client so we need to create one
             self.mqtt_client = self.get_client()
