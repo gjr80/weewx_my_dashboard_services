@@ -341,6 +341,7 @@ class MqttDashboardRealtimeThread(threading.Thread):
         retain = to_bool(mqtt_config_dict.get('retain', True))
         # log successful publishing of data
         log_success = to_bool(mqtt_config_dict.get('log_success', False))
+        mqtt_debug = to_int(mqtt_config_dict.get('mqtt_debug', 0))
 
         # the fields we are to include in our output
         self.inputs = rt_config_dict.get('inputs', {})
@@ -355,7 +356,8 @@ class MqttDashboardRealtimeThread(threading.Thread):
                                        tls=tls_opt,
                                        retain=retain,
                                        qos=qos,
-                                       log_success=log_success)
+                                       log_success=log_success,
+                                       mqtt_debug=mqtt_debug)
 
         # initialise some properties we will use
         # TimeSpan for the current day
@@ -431,7 +433,9 @@ class MqttDashboardRealtimeThread(threading.Thread):
             # our packet timestamp belongs to the following day
             if packet['dateTime'] > self.day_span.stop:
                 # we have a packet from a new day, so reset the Buffer stats
+                loginf("start of day resetting buffer. self.buffer['rain'].sum=%s" % (self.buffer['rain'].sum,))
                 self.buffer.start_of_day_reset()
+                loginf("buffer reset. self.buffer['rain'].sum=%s" % (self.buffer['rain'].sum,))
                 # and reset our day_span
                 self.day_span = weeutil.weeutil.archiveDaySpan(packet['dateTime'])
                 # and set the new_day proprty to True
@@ -451,8 +455,10 @@ class MqttDashboardRealtimeThread(threading.Thread):
             # if its a new day and hour >= 9 and minute > 0 or second > 0 we need
             # to reset any 9am sums
             if self.new_day and _h >= 9 and (_m > 0 or _s > 0):
+                loginf("9am resetting buffer. self.buffer['rain'].nineam_sum=%s _h=%s _m=%s _s=%s" % (self.buffer['rain'].nineam_sum, _h, _m, _s))
                 self.new_day = False
                 self.buffer.nineam_reset()
+                loginf("9am buffer RESET. self.buffer['rain'].nineam_sum=%s" % (self.buffer['rain'].nineam_sum,))
         else:
             # we don't have a day_span, it must be the first packet since we
             # started, so initialise a day_span
@@ -461,6 +467,7 @@ class MqttDashboardRealtimeThread(threading.Thread):
             # sum in our Buffer object, we couldn't do it earlier as we did not
             # know which 9am to use, yesterdays or todays
             self.buffer['rain'].nineam_sum = self.get_nineam_rain(packet['dateTime'])
+            loginf("setting 9am rain=%s" % (self.buffer['rain'].nineam_sum,))
 
         # convert our incoming packet
         _conv_packet = weewx.units.to_std_system(packet,
@@ -885,6 +892,8 @@ class MqttDashboardAerisThread(threading.Thread):
         retain = to_bool(mqtt_config_dict.get('retain', True))
         # log successful publishing of data
         log_success = to_bool(mqtt_config_dict.get('log_success', False))
+        mqtt_debug = to_int(mqtt_config_dict.get('mqtt_debug', 0))
+        mqtt_debug = to_int(mqtt_config_dict.get('mqtt_debug', 0))
 
         # do our config logging before the Publisher
         loginf("Data will be published to %s" % obfuscate_password(server_url))
@@ -897,7 +906,8 @@ class MqttDashboardAerisThread(threading.Thread):
                                        tls=tls_opt,
                                        retain=retain,
                                        qos=qos,
-                                       log_success=log_success)
+                                       log_success=log_success,
+                                       mqtt_debug=mqtt_debug)
 
         # list of the Aeris API 'endpoints' to be used
 #        self.endpoints = ['observations', 'forecasts']
@@ -1787,20 +1797,20 @@ class MqttPublisher(object):
                     self.mqtt_client.reconnect()
                 except (socket.error, socket.timeout, socket.herror) as e:
                     loginf("socket error: %s" % (e,))
+#                else:
+                # was the reconnect successful
+                if self.mqtt_client.connected:
+                    # start the client loop
+                    self.mqtt_client.loop_start()
                 else:
-                    # was the reconnect successful
-                    if self.mqtt_client.connected:
-                        # start the client loop
-                        self.mqtt_client.loop_start()
-                    else:
-                        # Could not reconnect, perhaps the broker has restarted.
-                        # Get a new client
-                        if weewx.debug >= 3 or self.mqtt_debug > 0:
-                            loginf("Could not reconnect to MQTT broker, creating new client...")
-                        # get a new client
-                        self.mqtt_client = self.get_client()
-                        if weewx.debug >= 3 or self.mqtt_debug > 0:
-                            loginf("New MQTT client created")
+                    # Could not reconnect, perhaps the broker has restarted.
+                    # Get a new client
+                    if weewx.debug >= 3 or self.mqtt_debug > 0:
+                        loginf("Could not reconnect to MQTT broker, creating new client...")
+                    # get a new client
+                    self.mqtt_client = self.get_client()
+                    if weewx.debug >= 3 or self.mqtt_debug > 0:
+                        loginf("New MQTT client created")
         else:
             # we don't have a client so we need to create one
             self.mqtt_client = self.get_client()
