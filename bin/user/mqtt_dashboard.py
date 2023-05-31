@@ -1,12 +1,12 @@
 """
 mqtt_dashboard.py
 
-A few WeeWX services for publishing to a MQTT broker.
+A collection of WeeWX services for publishing to my MQTT broker.
 
 Portions based on the MQTT uploader v0.23 Copyright 2013-2021 Matthew Wall and
 distributed under the terms of the GNU Public License (GPLv3).
 
-Copyright (C) 2021 Gary Roderick                gjroderick<at>gmail.com
+Copyright (C) 2021-2023 Gary Roderick                gjroderick<at>gmail.com
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -20,35 +20,35 @@ PARTICULAR PURPOSE.  See the GNU General Public License for more details.
 You should have received a copy of the GNU General Public License along with
 this program.  If not, see http://www.gnu.org/licenses/.
 
-Version: 0.1.0                                        Date: 9 March 2021
+Version: 0.2.0                                      Date: 30 May 2023
 
 Revision History
+    30 May 2023         v0.2.0
+        - reworked MQTT client reconnection logic
     9 March 2021        v0.1.0
         -   initial release
 
 This file contains the class definitions for the following WeeWX services:
 
-MQTTDashboardLoop - a RESTful service for publishing WeeWX loop data to a MQTT
+MQTTDashboardLoop:  a RESTful service for publishing WeeWX loop data to a MQTT
                     broker
 
-MqttDashboardAeris - a service for obtaining and publishing Aeris forecast and
-                     conditions data to a MQTT broker
+MqttDashboardAeris: a service for obtaining and publishing Aeris forecast and
+                    conditions data to a MQTT broker
 
-MqttDashboardSlow - a service for publishing slow changing observation (usually
+MqttDashboardSlow:  a service for publishing slow changing observation (usually
                     aggregate) data to a MQTT broker every archive period
 
 Supporting class definitions include:
 
-MqttPublisher - a class for publishing data to a MQTT broker
+MqttPublisher: a class for publishing data to a MQTT broker
 
-TLSDefaults - a class used to construct default TLS options for use when using
-              TLS to conenct to a MQTT broker
+TLSDefaults:   a class used to construct default TLS options for use when using
+               TLS to connect to a MQTT broker
 
-DayCache - a specialist cache of day based observation data
-
+DayCache:      a specialist cache of day based observation data
 """
 # Python imports
-import configobj
 import datetime
 import json
 import math
@@ -60,7 +60,7 @@ import threading
 import time
 from operator import itemgetter
 
-# Python2/3 imports in different libraries
+# Python 2/3 imports in different libraries
 try:
     import queue as Queue
 except ImportError:
@@ -88,7 +88,7 @@ import weewx.tags
 import weewx.xtypes
 from weeutil.config import conditional_merge
 from weewx.units import ValueTuple
-from weeutil.weeutil import to_bool, to_float, to_int, timestamp_to_string
+from weeutil.weeutil import to_bool, to_float, to_int, timestamp_to_string, to_sorted_string
 
 # import/setup logging, WeeWX v3 is syslog based but WeeWX v4 is logging based,
 # try v4 logging and if it fails use v3 logging
@@ -185,9 +185,11 @@ class FailedPost(IOError):
 class MqttDashboardService(weewx.engine.StdService):
     """Base class Service that publishes data to an MQTT broker.
 
+    Normally subclassed by a class using a threaded object to deal with an
+    external device/service.
+
     Creates a Queue object for passing loop packets and archive records to its
-    subordinate thread. Also passes None via the Queue object as a signal to
-    the subordinate thread to close.
+    subordinate thread.
 
     Includes methods for placing loop packets and archive records in the Queue,
     derived classes should include their own bindings to the relevant WeeWX
@@ -197,7 +199,7 @@ class MqttDashboardService(weewx.engine.StdService):
     a signal to shut down.
     """
 
-    def __init__(self, engine, config_dict, service_dict):
+    def __init__(self, engine, config_dict):
         # initialize my superclass
         super(MqttDashboardService, self).__init__(engine, config_dict)
 
@@ -220,31 +222,35 @@ class MqttDashboardService(weewx.engine.StdService):
         """Puts archive records in the queue."""
 
         self.queue.put(event.record)
-        if weewx.debug >= 2:
-            logdbg("Queued archive record dateTime=%s"
-                   % timestamp_to_string(event.record['dateTime']))
+        if self.mqtt_debug >= 3:
+            loginf("Queued archive record: %s %s" % (timestamp_to_string(event.record['dateTime']),
+                                                     to_sorted_string(event.record)))
+        elif self.mqtt_debug == 2:
+            loginf("Queued archive record dateTime=%s" % timestamp_to_string(event.record['dateTime']))
 
     def new_loop_packet(self, event):
         """Puts loop packets in the queue."""
 
         self.queue.put(event.packet)
-        if weewx.debug >= 2:
-            logdbg("Queued loop packet dateTime=%s"
-                   % timestamp_to_string(event.packet['dateTime']))
+        if self.mqtt_debug >= 3:
+            loginf("Queued loop packet: %s %s" % (timestamp_to_string(event.packet['dateTime']),
+                                                  to_sorted_string(event.packet)))
+        elif self.mqtt_debug == 2:
+            loginf("Queued loop packet dateTime=%s" % timestamp_to_string(event.packet['dateTime']))
 
     def shutDown(self):
         """Shut down any threads."""
 
         if hasattr(self, 'queue') and hasattr(self, 'thread'):
             if self.queue and self.thread.is_alive():
-                # put a None in the queue to signal the thread to shutdown
+                # put a None in the queue to signal the thread to shut down
                 self.queue.put(None)
                 # wait up to 20 seconds for the thread to exit:
                 self.thread.join(20.0)
                 if self.thread.is_alive():
-                    logerr("Unable to shut down %s thread" % self.thread.name)
+                    logerr("Unable to shut down '%s' thread" % self.thread.name)
                 else:
-                    logdbg("Shut down %s thread" % self.thread.name)
+                    logdbg("Shut down '%s' thread" % self.thread.name)
 
 
 # ============================================================================
@@ -254,52 +260,44 @@ class MqttDashboardService(weewx.engine.StdService):
 class MqttDashboardRealtime(MqttDashboardService):
     """Service that publishes loop based data to a MQTT broker."""
 
-    version = '0.1.0'
+    version = '0.2.0'
 
     def __init__(self, engine, config_dict):
 
         # first up say what we are loading
         loginf("Loading service MqttDashboardRealtime v%s" % MqttDashboardRealtime.version)
 
-        # obtain config dicts for our service
-        # first do we have a MQTTDashboard stanza in the config dict
-        if 'MQTTDashboard' in config_dict:
-            # we have a MQTTDashboard stanza now get the [[Realtime]] stanza as a
-            # config dict
-            rt_config_dict = configobj.ConfigObj(config_dict['MQTTDashboard'].get('Realtime',
-                                                                                  dict()))
-            # get the [[[MQTT]]] stanza from the Realtime config dict
-            mqtt_config_dict = configobj.ConfigObj(rt_config_dict.get('MQTT', dict()))
-            # merge in any MQTT config from [MQTTDashboard] [[MQTT]]
-            conditional_merge(mqtt_config_dict, config_dict['MQTTDashboard'].get('MQTT',
-                                                                                 dict()))
-            # ensure we have any essential MQTT config, just call the essential
-            # config elements and catch any KeyErrors
-            try:
-                _ = mqtt_config_dict['server_url']
-                _ = mqtt_config_dict['topic']
-            except KeyError as e:
-                logerr("Service MqttDashboardRealtime not loaded: Missing option %s" % (e,))
-                return
-        else:
-            # if we have no MQTTDashboard config dict, ie [MQTTDashboard], we
-            # can't go on so log the failure and return
-            loginf("Service MqttDashboardRealtime not loaded: missing [MQTTDashboard] stanza")
+        # get my config dict
+        try:
+            rt_config_dict = weeutil.config.accumulateLeaves(config_dict['MQTTDashboard']['Realtime'],
+                                                             max_level=1)
+        except KeyError:
+            logerr("Service MqttDashboardRealtime not loaded: Unable to find [MQTTDashboard] [[Realtime]] config stanza")
+            return
+        # we have our config dict, now get my broker config dict
+        broker_config_dict = get_mqtt_broker_dict(config_dict=config_dict,
+                                                  service='Realtime',
+                                                  service_class_name='MqttDashboardRealtime',
+                                                  reqd_options=['server_url', 'topic'])
+        # if our broker config dict is None we are unable to continue
+        if broker_config_dict is None:
             return
 
-        # now we can initialize my superclass
-        super(MqttDashboardRealtime, self).__init__(engine, config_dict, rt_config_dict)
+        # now initialize my superclass
+        super(MqttDashboardRealtime, self).__init__(engine, config_dict)
 
         # get a manager config dict, we need this to access the database
         manager_dict = weewx.manager.get_manager_dict_from_config(config_dict,
                                                                   'wx_binding')
-
+        # get our mqtt_debug level, if we don't have such a config option use 0
+        mqtt_debug = rt_config_dict.get('mqtt_debug', 0)
         # get an instance of class MqttDashboardRealtimeThread and start the
         # thread running
         self.thread = MqttDashboardRealtimeThread(queue=self.queue,
                                                   rt_config_dict=rt_config_dict,
-                                                  mqtt_config_dict=mqtt_config_dict,
-                                                  manager_dict=manager_dict)
+                                                  broker_config_dict=broker_config_dict,
+                                                  manager_dict=manager_dict,
+                                                  mqtt_debug=mqtt_debug)
         self.thread.start()
 
         # bind ourself to the WeeWX NEW_LOOP_PACKET event
@@ -310,46 +308,51 @@ class MqttDashboardRealtime(MqttDashboardService):
 
 
 # ============================================================================
-#                       class MqttDashboardAerisThread
+#                     class MqttDashboardRealtimeThread
 # ============================================================================
 
 class MqttDashboardRealtimeThread(threading.Thread):
     """Thread to publish loop based data to a MQTT broker."""
 
-    def __init__(self, queue, rt_config_dict, mqtt_config_dict, manager_dict):
+    def __init__(self, queue, rt_config_dict, broker_config_dict, manager_dict, mqtt_debug):
 
-        # Initialize my superclass
+        # initialize my superclass
         threading.Thread.__init__(self)
 
-        # set my thread and run as a daemon
+        # set my thread name and run as a daemon
         self.setName('MqttDashboardRealtimeThread')
         self.setDaemon(True)
-        # our queue for receiving data
+        # save our queue for receiving data
         self.queue = queue
-        # manager dict so we can access the database
+        # save a manager dict so we can access the database
         self.manager_dict = manager_dict
 
         # MQTT broker URL
-        server_url = mqtt_config_dict.get('server_url')
-        # topics to publish to
-        self.topic = mqtt_config_dict.get('topic', 'weather/realtime')
+        server_url = broker_config_dict.get('server_url')
+        # topic to publish to
+        self.topic = broker_config_dict.get('topic', 'weather/realtime')
         # TLS options
-        tls_opt = mqtt_config_dict.get('tls', None)
+        tls_opt = broker_config_dict.get('tls', None)
         # quality of service
-        qos = to_int(mqtt_config_dict.get('tls', 0))
+        qos = to_int(broker_config_dict.get('tls', 0))
         # will MQTT broker retain messages
-        retain = to_bool(mqtt_config_dict.get('retain', True))
+        retain = to_bool(broker_config_dict.get('retain', True))
         # log successful publishing of data
-        log_success = to_bool(mqtt_config_dict.get('log_success', False))
-        mqtt_debug = to_int(mqtt_config_dict.get('mqtt_debug', 0))
+        log_success = to_bool(broker_config_dict.get('log_success', False))
+        # save our mqtt_debug level
+        self.mqtt_debug = mqtt_debug
 
         # the fields we are to include in our output
         self.inputs = rt_config_dict.get('inputs', {})
 
         # do our config logging before the Publisher
-        loginf("Data will be published to %s under topic '%s'" % (obfuscate_password(server_url),
-                                                                  self.topic))
-        loginf("qos is %d, retain is %r, log success is %s" % (qos, retain, log_success))
+        loginf("%s: Data will be published to '%s' under topic '%s'" % (self.name,
+                                                                        obfuscate_password(server_url),
+                                                                        self.topic))
+        loginf("%s: qos is %d, retain is %r, log success is %s" % (self.name,
+                                                                   qos,
+                                                                   retain,
+                                                                   log_success))
 
         # get a MQTTPublisher object to do the publishing for us
         self.publisher = MqttPublisher(server_url=server_url,
@@ -408,24 +411,23 @@ class MqttDashboardRealtimeThread(threading.Thread):
                 # we now have a packet to process
                 # First, log receipt. The amount of logging depends on the debug
                 # level.
-                if weewx.debug >= 2:
-                    logdbg("Received loop packet")
-                elif weewx.debug >= 3:
-                    logdbg("Received loop packet: %s" % (_package, ))
+                if self.mqtt_debug >= 3:
+                    loginf("Received loop packet: %s %s" % (timestamp_to_string(_package['dateTime']),
+                                                            to_sorted_string(_package)))
+                elif self.mqtt_debug == 2:
+                    loginf("Received loop packet dateTime=%s" % timestamp_to_string(_package['dateTime']))
                 # and finally process the packet
                 self.process_packet(_package)
         except Exception as e:
             # Some unknown exception occurred. This is probably a serious
-            # problem. Exit.
+            # problem. Log and exit.
             logcrit("Unexpected exception of type %s" % (type(e), ))
             log_traceback_critical('mqttdashboardrealtimethread: **** ')
             logcrit("Thread exiting. Reason: %s" % (e, ))
 
     def process_packet(self, packet):
-        """Process a loop packet."""
+        """Process a received loop packet."""
 
-        # get the current time for debug timing
-        t1 = time.time()
         # if we have the first packet from a new day we need to reset the Buffer
         # objects stats
         if self.day_span is not None:
@@ -433,32 +435,40 @@ class MqttDashboardRealtimeThread(threading.Thread):
             # our packet timestamp belongs to the following day
             if packet['dateTime'] > self.day_span.stop:
                 # we have a packet from a new day, so reset the Buffer stats
-                loginf("start of day resetting buffer. self.buffer['rain'].sum=%s" % (self.buffer['rain'].sum,))
+                # TODO. Development code only, remove statement before release
+                if self.mqtt_debug >= 1:
+                    loginf("Start of day, resetting buffer[rain].sum. buffer[rain].sum=%s" % (self.buffer['rain'].sum,))
                 self.buffer.start_of_day_reset()
-                loginf("buffer reset. self.buffer['rain'].sum=%s" % (self.buffer['rain'].sum,))
+                # TODO. Development code only, remove statement before release
+                if self.mqtt_debug >= 1:
+                    loginf("Buffer reset. buffer[rain].sum=%s" % (self.buffer['rain'].sum,))
                 # and reset our day_span
                 self.day_span = weeutil.weeutil.archiveDaySpan(packet['dateTime'])
-                # and set the new_day proprty to True
+                # and set the new_day property to True
                 self.new_day = True
             # If this is the first packet after 9am we need to reset any 9am
             # sums. There is a bit a dilemma here, a packet timestamped at 9am
             # actually has data from the period before 9am, so if we reset when
-            # the packet is timestamped 9am we might then add data to our
-            # buffer that was from before 9am. But if we reset on the first
-            # packet after 9am we may be displaying yesterdays rain from 9am
-            # until that next packet comes in. Since loop packets come in very
+            # the packet is timestamped 9am we might add data to our buffer
+            # that was from before 9am. But if we reset on the first packet
+            # after 9am we may be displaying yesterday's rain from 9am until
+            # the next packet comes in. Since loop packets usually come in very
             # regularly we will choose to reset on the first packet after 9am.
 
             # first get the hour and minutes of the packet timestamp as an ints
             _hms = time.strftime('%H:%M:%S', time.localtime(packet['dateTime']))
             _h, _m, _s = [int(x) for x in _hms.split(':')]
-            # if its a new day and hour >= 9 and minute > 0 or second > 0 we need
+            # if it's a new day and hour >= 9 and minute > 0 or second > 0 we need
             # to reset any 9am sums
             if self.new_day and _h >= 9 and (_m > 0 or _s > 0):
-                loginf("9am resetting buffer. self.buffer['rain'].nineam_sum=%s _h=%s _m=%s _s=%s" % (self.buffer['rain'].nineam_sum, _h, _m, _s))
+                # TODO. Development code only, remove statement before release
+                if self.mqtt_debug >= 1:
+                    loginf("9am resetting buffer. buffer[rain].nineam_sum=%s" % (self.buffer['rain'].nineam_sum,))
                 self.new_day = False
                 self.buffer.nineam_reset()
-                loginf("9am buffer RESET. self.buffer['rain'].nineam_sum=%s" % (self.buffer['rain'].nineam_sum,))
+                # TODO. Development code only, remove statement before release
+                if self.mqtt_debug >= 1:
+                    loginf("9am buffer reset. buffer[rain].nineam_sum=%s" % (self.buffer['rain'].nineam_sum,))
         else:
             # we don't have a day_span, it must be the first packet since we
             # started, so initialise a day_span
@@ -467,7 +477,8 @@ class MqttDashboardRealtimeThread(threading.Thread):
             # sum in our Buffer object, we couldn't do it earlier as we did not
             # know which 9am to use, yesterdays or todays
             self.buffer['rain'].nineam_sum = self.get_nineam_rain(packet['dateTime'])
-            loginf("setting 9am rain=%s" % (self.buffer['rain'].nineam_sum,))
+            if self.mqtt_debug >= 1:
+                loginf("setting 9am rain=%s" % (self.buffer['rain'].nineam_sum,))
 
         # convert our incoming packet
         _conv_packet = weewx.units.to_std_system(packet,
@@ -484,7 +495,10 @@ class MqttDashboardRealtimeThread(threading.Thread):
                                _conv_packet.get('dateTime', int(time.time())))
 
     def generate_message(self, packet):
-        """Generate the message to be published."""
+        """Generate the message to be published.
+
+        Creates and returns a dict containing the data to be published.
+        """
 
         data = {'dateTime': packet['dateTime'],
                 'usUnits': packet['usUnits']}
@@ -608,56 +622,45 @@ class MqttDashboardAeris(MqttDashboardService):
         ShutDown.           Shutdown any child threads. Inherited.
     """
 
-    version = '0.1.0'
+    version = '0.2.0'
 
     def __init__(self, engine, config_dict):
 
         # first up say what we are loading
         loginf("Loading service MqttDashboardAeris v%s" % MqttDashboardAeris.version)
 
-        # obtain config dicts for our service
-        # first do we have a MQTTDashboard stanza in the config dict
-        if 'MQTTDashboard' in config_dict:
-            # we have a MQTTDashboard stanza now get the [[Aeris]] stanza as a
-            # config dict
-            aeris_config_dict = configobj.ConfigObj(config_dict['MQTTDashboard'].get('Aeris',
-                                                                                     dict()))
-            # get the [[[MQTT]]] stanza from the Aeris config dict
-            mqtt_config_dict = configobj.ConfigObj(aeris_config_dict.get('MQTT', dict()))
-            # merge in any MQTT config from [MQTTDashboard] [[MQTT]]
-            conditional_merge(mqtt_config_dict, config_dict['MQTTDashboard'].get('MQTT',
-                                                                                 dict()))
-            # ensure we have any essential MQTT config, just call the essential
-            # config elements and catch any KeyErrors
-            try:
-                _ = aeris_config_dict['client_id']
-                _ = aeris_config_dict['client_secret']
-            except KeyError as e:
-                logerr("Service MqttDashboardAeris not loaded: Missing option %s" % (e,))
-                return
-        else:
-            # if we have no MQTTDashboard config dict, ie [MQTTDashboard], we
-            # can't go on so log the failure and return
-            loginf("Service MqttDashboardAeris not loaded: missing [MQTTDashboard] stanza")
+        # get my config dict
+        try:
+            aeris_config_dict = weeutil.config.accumulateLeaves(config_dict['MQTTDashboard']['Aeris'],
+                                                                max_level=1)
+        except KeyError:
+            logerr("Service MqttDashboardAeris not loaded: Unable to find [MQTTDashboard] [[Aeris]] config stanza")
+            return
+        # we have our config dict, now get my broker config dict
+        broker_config_dict = get_mqtt_broker_dict(config_dict=config_dict,
+                                                  service='Aeris',
+                                                  service_class_name='MqttDashboardAeris',
+                                                  reqd_options=['client_id', 'client_secret'])
+        # if our broker config dict is None we are unable to continue
+        if broker_config_dict is None:
             return
 
         # initialize my superclass
-        super(MqttDashboardAeris, self).__init__(engine, config_dict, aeris_config_dict)
+        super(MqttDashboardAeris, self).__init__(engine, config_dict)
 
+        # get our mqtt_debug level, if we don't have such a config option use 0
+        mqtt_debug = aeris_config_dict.get('mqtt_debug', 0)
         # get an instance of class MqttDashboardAerisThread and start the
         # thread running
         alt_m = weewx.units.convert(engine.stn_info.altitude_vt, 'meter').value
         self.thread = MqttDashboardAerisThread(self.queue,
-                                               config_dict,
                                                aeris_config_dict,
-                                               mqtt_config_dict,
+                                               broker_config_dict,
                                                lat=engine.stn_info.latitude_f,
                                                long=engine.stn_info.longitude_f,
-                                               alt_m=alt_m)
+                                               alt_m=alt_m,
+                                               mqtt_debug=mqtt_debug)
         self.thread.start()
-
-        # bind ourself to the WeeWX NEW_ARCHIVE_RECORD event
-        self.bind(weewx.NEW_ARCHIVE_RECORD, self.new_archive_record)
 
 
 # ============================================================================
@@ -863,14 +866,15 @@ class MqttDashboardAerisThread(threading.Thread):
         }
     }
 
-    def __init__(self, queue, config_dict, aeris_config_dict, mqtt_config_dict,
-                 lat, long, alt_m):
+    def __init__(self, queue, aeris_config_dict, mqtt_config_dict, lat, long, alt_m, mqtt_debug):
 
         # Initialize my superclass
         threading.Thread.__init__(self)
 
+        # set my thread name and run as a daemon
         self.setName('MqttDashboardAerisThread')
         self.setDaemon(True)
+        # save our queue for receiving data
         self.queue = queue
 
         # Get station info required for Sun related calcs
@@ -892,14 +896,20 @@ class MqttDashboardAerisThread(threading.Thread):
         retain = to_bool(mqtt_config_dict.get('retain', True))
         # log successful publishing of data
         log_success = to_bool(mqtt_config_dict.get('log_success', False))
-        mqtt_debug = to_int(mqtt_config_dict.get('mqtt_debug', 0))
-        mqtt_debug = to_int(mqtt_config_dict.get('mqtt_debug', 0))
+        # save our mqtt_debug level
+        self.mqtt_debug = mqtt_debug
 
         # do our config logging before the Publisher
-        loginf("Data will be published to %s" % obfuscate_password(server_url))
-        loginf("Conditions will be published to topic '%s'" % self.topic['observations'])
-        loginf("Forecast will be published to topic '%s'" % self.topic['forecasts'])
-        loginf("qos is %d, retain is %r, log success is %s" % (qos, retain, log_success))
+        loginf("%s: Data will be published to '%s'" % (self.name,
+                                                       obfuscate_password(server_url)))
+        loginf("%s: Conditions will be published to topic '%s'" % (self.name,
+                                                                   self.topic['observations']))
+        loginf("%s: Forecast will be published to topic '%s'" % (self.name,
+                                                                 self.topic['forecasts']))
+        loginf("%s: qos is %d, retain is %r, log success is %s" % (self.name,
+                                                                   qos,
+                                                                   retain,
+                                                                   log_success))
 
         # get a MQTTPublisher object to do the publishing for us
         self.publisher = MqttPublisher(server_url=server_url,
@@ -931,7 +941,7 @@ class MqttDashboardAerisThread(threading.Thread):
         self.last_call_ts = None
         # Get our API key from weewx.conf, first look in [Weewx-WD] and if no luck
         # try [Forecast] if it exists. Wrap in a try..except loop to catch exceptions (ie one or
-        # both don't exist.
+        # both don't exist).
         client_id = aeris_config_dict.get('client_id')
         if client_id is None:
             raise MissingApiKey("Cannot find valid Aeris client ID")
@@ -1002,7 +1012,7 @@ class MqttDashboardAerisThread(threading.Thread):
             # has the lockout period passed since the last call of this
             # feature?
             if self.last_call_ts is None or ((now + 1 - self.lockout_period) >= self.last_call_ts):
-                # If we haven't made this API call previously or if its been
+                # If we haven't made this API call previously or if it has been
                 # too long since the last call then make the call
                 if (self.last[endpoint] is None) or \
                         ((now + 1 - self.interval[endpoint]) >= self.last[endpoint]):
@@ -1213,10 +1223,10 @@ class AerisAPI(object):
         Parameters:
             endpoint:    The Aeris API endpoint to be used. String.
             action:      A modifier to support the endpoint, for example a
-                         location for which the data is require. String.
-            parameters:  Optional parameters to be to be included in the API
-                         call eg filter to filter to limit the results.
-                         Dictionary with elements in the format parameter: value.
+                         location for which the data is required. String.
+            parameters:  Optional parameters to be included in the API call
+                         eg filter to filter to limit the results. Dictionary
+                         with elements in the format parameter: value.
             max_tries:   The maximum number of attempts to be made to obtain a
                          response from the API. Default is 3.
 
@@ -1285,8 +1295,8 @@ class MqttDashboardSlow(MqttDashboardService):
     """Service that publishes slow changing JSON format data to an MQTT broker.
 
     The MQTTDashboardSlow class creates and controls a threaded object of class
-    MQTTDashboardSlowThread that generates slow changing JSON data once each archive
-    period and publishes this data to a MQTT broker.
+    MQTTDashboardSlowThread that generates slow changing JSON data once each
+    archive period and publishes this data to a MQTT broker.
 
     MQTTDashboardSlow constructor parameters:
 
@@ -1300,52 +1310,46 @@ class MqttDashboardSlow(MqttDashboardService):
                             record.
         ShutDown.           Shutdown any child threads.
     """
-    version = '0.1.0'
+    version = '0.2.0'
 
     def __init__(self, engine, config_dict):
 
         # first up say what we are loading
         loginf("Loading service MqttDashboardSlow v%s" % MqttDashboardSlow.version)
 
-        # obtain config dicts for our service
-        # first do we have a MQTTDashboard stanza in the config dict
-        if 'MQTTDashboard' in config_dict:
-            # we have a MQTTDashboard stanza now get the [[Slow]] stanza as a
-            # config dict
-            slow_config_dict = configobj.ConfigObj(config_dict['MQTTDashboard'].get('Slow',
-                                                                                    dict()))
-            # get the [[[MQTT]]] stanza from the Slow config dict
-            mqtt_config_dict = configobj.ConfigObj(slow_config_dict.get('MQTT', dict()))
-            # merge in any MQTT config from [MQTTDashboard] [[MQTT]]
-            conditional_merge(mqtt_config_dict, config_dict['MQTTDashboard'].get('MQTT',
-                                                                                 dict()))
-            # ensure we have any essential MQTT config, just call the essential
-            # config elements and catch any KeyErrors
-            try:
-                _ = mqtt_config_dict['server_url']
-                _ = mqtt_config_dict['topic']
-            except KeyError as e:
-                logerr("Service MqttDashboardSlow not loaded: Missing option %s" % (e,))
-                return
-        else:
-            # if we have no MQTTDashboard config dict, ie [MQTTDashboard], we
-            # can't go on so log the failure and return
-            loginf("Service MqttDashboardSlow not loaded: missing [MQTTDashboard] stanza")
+        # get my config dict
+        try:
+            slow_config_dict = weeutil.config.accumulateLeaves(config_dict['MQTTDashboard']['Slow'],
+                                                               max_level=1)
+        except KeyError:
+            logerr("Service MqttDashboardSlow not loaded: Unable to find [MQTTDashboard] [[Slow]] config stanza")
+            return
+        # we have our config dict, now get my broker config dict
+        broker_config_dict = get_mqtt_broker_dict(config_dict=config_dict,
+                                                  service='Slow',
+                                                  service_class_name='MqttDashboardSlow',
+                                                  reqd_options=['server_url', 'topic'])
+        # if our broker config dict is None we are unable to continue
+        if broker_config_dict is None:
             return
 
         # initialize my superclass
-        super(MqttDashboardSlow, self).__init__(engine, config_dict, slow_config_dict)
+        super(MqttDashboardSlow, self).__init__(engine, config_dict)
 
+        # get our mqtt_debug level, if we don't have such a config option use
+        # our parents
+        mqtt_debug = slow_config_dict.get('mqtt_debug', self.mqtt_debug)
         # get an instance of class MQTTDashboardSlowThread and start the thread
         # running
         alt_m = weewx.units.convert(engine.stn_info.altitude_vt, 'meter').value
-        self.thread = MqttDashboardSlowThread(self.queue,
-                                              config_dict,
-                                              slow_config_dict,
-                                              mqtt_config_dict,
+        self.thread = MqttDashboardSlowThread(queue=self.queue,
+                                              config_dict=config_dict,
+                                              slow_config_dict=slow_config_dict,
+                                              server_config_dict=server_config_dict,
                                               lat=engine.stn_info.latitude_f,
                                               long=engine.stn_info.longitude_f,
-                                              alt_m=alt_m)
+                                              alt_m=alt_m,
+                                              mqtt_debug=mqtt_debug)
         self.thread.start()
 
         # bind ourself to the WeeWX NEW_ARCHIVE_RECORD event
@@ -1383,18 +1387,21 @@ class MqttDashboardSlowThread(threading.Thread):
         calculate.      Calculate/generate the data to be published.
     """
 
-    def __init__(self, queue, config_dict, slow_config_dict, mqtt_config_dict,
-                 lat, long, alt_m):
+    def __init__(self, queue, config_dict, slow_config_dict, server_config_dict,
+                 lat, long, alt_m, mqtt_debug):
 
         # initialize my superclass
         threading.Thread.__init__(self)
 
+        # set my thread name and run as a daemon
         self.setName('MqttDashboardSlowThread')
         self.setDaemon(True)
+        # save our queue for receiving data
         self.queue = queue
+        # save our config dict
         self.config_dict = config_dict
 
-
+        # get the moon phase names to use, default to the WeeWX defaults
         self.moonphases = slow_config_dict.get('Almanac', {}).get('moon_phases',
                                                                   weeutil.Moon.moon_phases)
 
@@ -1407,19 +1414,29 @@ class MqttDashboardSlowThread(threading.Thread):
         # now bind self.converter to the appropriate standard converter
         self.converter = weewx.units.StdUnitConverters[self.target_unit]
 
-        # get MQTT config options
-        server_url = mqtt_config_dict.get('server_url', None)
-        self.topic = mqtt_config_dict.get('topic', 'weather/slow')
-        tls_opt = mqtt_config_dict.get('tls', None)
-        qos = to_int(mqtt_config_dict.get('tls', 0))
-        retain = to_bool(mqtt_config_dict.get('retain', True))
-        log_success = to_bool(mqtt_config_dict.get('log_success', True))
-        mqtt_debug = to_int(mqtt_config_dict.get('mqtt_debug', 0))
+        # MQTT broker URL
+        server_url = server_config_dict.get('server_url')
+        # topic to publish to
+        self.topic = server_config_dict.get('topic', 'weather/slow')
+        # TLS options
+        tls_opt = server_config_dict.get('tls', None)
+        # quality of service
+        qos = to_int(server_config_dict.get('tls', 0))
+        # will MQTT broker retain messages
+        retain = to_bool(server_config_dict.get('retain', True))
+        # log successful publishing of data
+        log_success = to_bool(server_config_dict.get('log_success', False))
+        # save our mqtt_debug level
+        self.mqtt_debug = mqtt_debug
 
         # do our config logging before the Publisher
-        loginf("Data will be published to %s" % obfuscate_password(server_url))
-        loginf("Topic is '%s'" % self.topic)
-        loginf("qos is %d, retain is %r, log success is %s" % (qos, retain, log_success))
+        loginf("%s: Data will be published to '%s' under topic '%s'" % (self.name,
+                                                                        obfuscate_password(server_url),
+                                                                        self.topic))
+        loginf("%s: qos is %d, retain is %r, log success is %s" % (self.name,
+                                                                   qos,
+                                                                   retain,
+                                                                   log_success))
 
         # get an MQTTPublisher object to do the publishing for us
         self.publisher = MqttPublisher(server_url=server_url,
@@ -1429,19 +1446,12 @@ class MqttDashboardSlowThread(threading.Thread):
                                        log_success=log_success,
                                        mqtt_debug=mqtt_debug)
 
-        # Set the binding to be used for data from an additional (ie not the
-        # [StdArchive]) binding. Default to 'wx_binding'.
-        self.additional_binding = slow_config_dict.get('additional_binding',
-                                                       'wx_binding')
-
-        # get some station info
+        # save some station info
         self.latitude = lat
         self.longitude = long
         self.altitude_m = alt_m
 
-        # initialise some properties that will pickup real values later
-        self.db_manager = None
-        self.additional_manager = None
+        # initialise some properties that will pick up real values later
         self.stats = None
         self.db_binder = None
         self.almanac = None
@@ -1453,7 +1463,7 @@ class MqttDashboardSlowThread(threading.Thread):
         this is done we wait for something in the queue.
         """
 
-        # Would normally do this in our class' __init__ but since we are are
+        # Would normally do this in our class' __init__ but since we are
         # running in a thread we need to wait until the thread is actually
         # running before we can get any db related objects.
 
@@ -1482,10 +1492,11 @@ class MqttDashboardSlowThread(threading.Thread):
 
             # we now have a record to process
             # first, log receipt
-            if weewx.debug >= 2:
-                logdbg("Received archive record")
-            elif weewx.debug > 2:
-                logdbg("Received archive record: %s" % (_package, ))
+            if self.mqtt_debug >= 3:
+                loginf("Received archive record: %s %s" % (timestamp_to_string(_package['dateTime']),
+                                                         to_sorted_string(_package)))
+            elif self.mqtt_debug == 2:
+                loginf("Received archive record dateTime=%s" % timestamp_to_string(_package['dateTime']))
             # process the record
             self.process_record(_package)
 
@@ -1527,8 +1538,9 @@ class MqttDashboardSlowThread(threading.Thread):
                                    json.dumps(data),
                                    data['dateTime'])
             # log the time taken to process this record
-            logdbg("Record (%s) processed in %.5f seconds" % (record['dateTime'],
-                                                              (time.time()-t1)))
+            if self.mqtt_debug >= 1:
+                loginf("Record (%s) processed in %.5f seconds" % (record['dateTime'],
+                                                                 (time.time() - t1)))
         except FailedPost as e:
             # data could not be published, log and continue
             logerr("Data was not published: %s" % (e, ))
@@ -1543,23 +1555,28 @@ class MqttDashboardSlowThread(threading.Thread):
         """Construct a data dict to be used as the JSON source.
 
         Parameters:
-            record: loop data record
+            record: data record received
 
         Returns:
             Dictionary containing the data to be posted.
         """
 
-        packet_d = dict(record)
-        ts = int(packet_d['dateTime'])
+        # make sure our incoming record is indeed a dict
+        record_d = dict(record)
+        # obtain the incoming record timestamp
+        ts = int(record_d['dateTime'])
 
         # initialise our result containing dict
         data = {}
+
+        # now work through each of the fields to be included in the data dict
+        # and populate each field
 
         # add dateTime and usUnits
         data['dateTime'] = ts
         data['usUnits'] = self.target_unit
 
-        # Add outTemp fields
+        # add outTemp fields
         outtemp = dict()
         # yesterday
         outtemp['yest'] = dict()
@@ -1573,28 +1590,28 @@ class MqttDashboardSlowThread(threading.Thread):
         # add outTemp fields to our data
         data['outTemp'] = outtemp
 
-        # Add barometer fields
+        # add barometer fields
         barometer = dict()
         # trend
         barometer['trend'] = to_float(self.stats.trend(time_delta=10800).barometer.raw)
         # add barometer fields to our data
         data['barometer'] = barometer
 
-        # Add dewpoint fields
+        # add dewpoint fields
         dewpoint = dict()
         # trend
         dewpoint['trend'] = to_float(self.stats.trend(time_delta=3600).dewpoint.raw)
         # add dewpoint fields to our data
         data['dewpoint'] = dewpoint
 
-        # Add outHumidity fields
+        # add outHumidity fields
         outhumidity = dict()
         # trend
         outhumidity['trend'] = to_float(self.stats.trend(time_delta=3600).outHumidity.raw)
         # add outHumidity fields to our data
         data['outHumidity'] = outhumidity
 
-        # Add wind fields
+        # add wind fields
         wind = dict()
         # windGust
         wind['windGust'] = dict()
@@ -1618,7 +1635,7 @@ class MqttDashboardSlowThread(threading.Thread):
         # add wind fields to our data
         data['wind'] = wind
 
-        # Add rain fields
+        # add rain fields
         rain = dict()
         # yesterday
         rain['yest'] = to_float(self.stats.yesterday().rain.sum.raw)
@@ -1629,7 +1646,7 @@ class MqttDashboardSlowThread(threading.Thread):
         # add rain fields to our data
         data['rain'] = rain
 
-        # Add radiation fields
+        # add radiation fields
         radiation = dict()
         # yesterday
         radiation['yest'] = dict()
@@ -1638,7 +1655,7 @@ class MqttDashboardSlowThread(threading.Thread):
         # add radiation fields to our data
         data['radiation'] = radiation
 
-        # Add UV fields
+        # add UV fields
         uv = dict()
         # yesterday
         uv['yest'] = dict()
@@ -1647,7 +1664,7 @@ class MqttDashboardSlowThread(threading.Thread):
         # add UV fields to our data
         data['UV'] = uv
 
-        # Add sun fields
+        # add sun fields
         sun = dict()
         # rise, set and day length
         sun['rise'] = self.almanac.sun.rise.raw
@@ -1660,7 +1677,7 @@ class MqttDashboardSlowThread(threading.Thread):
         # add sun fields to our data
         data['sun'] = sun
 
-        # Add moon fields
+        # add moon fields
         moon = dict()
         # rise and set
         if self.almanac.hasExtras:
@@ -1703,6 +1720,7 @@ class MqttDashboardSlowThread(threading.Thread):
         # add moon fields to our data
         data['moon'] = moon
 
+        # now return the completed data dict
         return data
 
 
@@ -1723,6 +1741,8 @@ class MqttPublisher(object):
                  qos=0, timeout=3, max_tries=3, retry_wait=3,
                  log_success=True, mqtt_debug=0):
 
+        # save our mqtt_debug setting
+        self.mqtt_debug = mqtt_debug
         # URL of the MQTT broker to be used
         self.server_url = server_url
         # obtain the client ID to be used, if not provided (ie is None)
@@ -1783,7 +1803,7 @@ class MqttPublisher(object):
         is raised with an appropriate error message. If a connection error
         message is received from the on_connect callback a ConnectionError
         exception is raised with the received connection error message.
-        Otherwise if the on_connect callback does not respond with a successful
+        Otherwise, if the on_connect callback does not respond with a successful
         connection within the timeout period a ConnectionError is raised.
         """
 
@@ -1820,7 +1840,7 @@ class MqttPublisher(object):
 
         # first get a Paho client object
         _client = mqtt.Client(self.client_id)
-        # setup the client callbacks
+        # set up the client callbacks
         _client.on_connect = self.on_connect
         _client.on_disconnect = self.on_disconnect
         _client.on_publish = self.on_publish
@@ -1934,8 +1954,8 @@ class MqttPublisher(object):
                         # and continue
                         continue
                     time.sleep(0.1)
-                # so the client thinks publication was a success, but what what
-                # was the actual result in res
+                # so the client thinks publication was a success, but what was
+                # the actual result in res
                 if res != mqtt.MQTT_ERR_SUCCESS:
                     # res is something other than success, this should not
                     # happen but log it anyway
@@ -2099,7 +2119,13 @@ class TLSDefaults(object):
 # ============================================================================
 
 class ObsBuffer(object):
-    """Base class to buffer an obs."""
+    """Base class to buffer an obs.
+
+    An object that keeps a limited data history for one or more obs. The object
+    can return various aggregates (eg max, sum or maxtime) based on the current
+    data history. With appropriate methods the object can buffer scalar obs or
+    vector obs.
+    """
 
     def __init__(self, stats, units=None, history=False):
         self.units = units
@@ -2272,7 +2298,7 @@ class VectorBuffer(ObsBuffer):
     def hist_vec_avg(self):
         """The history average vector.
 
-        The period over which the average is calculated is the the history
+        The period over which the average is calculated is the history
         retention period (nominally 10 minutes).
         """
 
@@ -2294,7 +2320,7 @@ class VectorBuffer(ObsBuffer):
     def hist_vec_dir(self):
         """The history vector average direction.
 
-        The period over which the average is calculated is the the history
+        The period over which the average is calculated is the history
         retention period (nominally 10 minutes).
         """
 
@@ -2383,6 +2409,9 @@ class Buffer(dict):
     archive record is written to archive will not be captured. For this reason
     selected loop data is buffered to ensure that such stats are correctly
     reflected.
+
+    The Buffer object has many similarities with the WeeWX accumulator, but the
+    Buffer object retains historical obs data for the period concerned.
     """
 
     def __init__(self, manifest, day_stats, additional_day_stats=None):
@@ -2536,7 +2565,7 @@ class ObsTuple(tuple):
 
     An observation during some period can be represented by the value of the
     observation and the time at which it was observed. This can be represented
-    in a two way tuple called an obs tuple. An obs tuple is useful because its
+    in a two-way tuple called an obs tuple. An obs tuple is useful because its
     contents can be accessed using named attributes.
 
     Item   attribute   Meaning
@@ -2547,7 +2576,7 @@ class ObsTuple(tuple):
     It is valid to have an observed value of None.
 
     It is also valid to have a ts of None (meaning there is no information
-    about the time the was was observed.
+    about the time the obs was observed).
     """
 
     def __new__(cls, *args):
@@ -2596,11 +2625,58 @@ class VectorTuple(tuple):
 #                             Utility functions
 # ============================================================================
 
+def get_mqtt_broker_dict(config_dict, service, service_class_name, reqd_options=None):
+    """Obtain MQTT broker options for a given MQTTDashboard service.
+
+    Obtains the MQTT broker options, with defaults, from the relevant MQTT
+    service stanza under [MQTTDashboard]. If the MQTT service is not enabled,
+    or if one or more required options is not specified, then return None.
+    """
+
+    try:
+        broker_dict = weeutil.config.accumulateLeaves(config_dict['MQTTDashboard'][service]['MQTT'],
+                                                      max_level=2)
+    except KeyError:
+        # we couldn't find the MQTT stanza for our broker
+        loginf("Service %s not loaded: No MQTT broker info." % service_class_name)
+        return None
+
+    # if broker_dict has the key 'enable' and it is False, then the service is
+    # not enabled
+    try:
+        if not to_bool(broker_dict['enable']):
+            loginf("Service %s not loaded: Service is not enabled." % service_class_name)
+            return None
+    except KeyError:
+        pass
+
+    # At this point, either the key 'enable' does not exist, or it is set to
+    # True. Check to see whether all the required options exist, and none of
+    # them have been set to 'replace_me'.
+    if reqd_options is not None:
+        try:
+            for option in reqd_options:
+                if broker_dict[option] == 'replace_me':
+                    raise KeyError(option)
+        except KeyError as e:
+            logdbg("Service %s not loaded: Missing option %s" % (service_class_name, e)
+            return None
+
+    # If the broker dictionary does not have a log_success or log_failure, get
+    # them from the root dictionary
+    broker_dict.setdefault('log_success', to_bool(config_dict.get('log_success', True)))
+    broker_dict.setdefault('log_failure', to_bool(config_dict.get('log_failure', True)))
+
+    # if it exists get rid of the no longer needed key 'enable'
+    broker_dict.pop('enable', None)
+
+    return broker_dict
+
 def obfuscate_password(url, o_str='xxx'):
     """Obfuscate the 'password' portion of a URL.
 
     Splits the URL into it's six component parts and then obfuscates the
-    Password sub-component of the netloc component. The URL is re-assembled
+    password subcomponent of the netloc component. The URL is re-assembled
     from the component parts and returned with the password obfuscated.
     """
 
@@ -2660,5 +2736,5 @@ def obfuscate_client(url, obf_ch='x'):
             # original url
             return url
     else:
-        # there is no query parameters so return the original url
+        # there are no query parameters so return the original url
         return url
