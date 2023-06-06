@@ -2158,55 +2158,6 @@ class ObsBuffer(object):
         # remove any values older than oldest_ts
         self.history = [s for s in self.history if s.ts > oldest_ts]
 
-    @property
-    def hist_max(self, ts, age=MAX_AGE):
-        """Return the max value in my history.
-
-        Search the last age seconds of my history for the max value and the
-        corresponding timestamp.
-
-        Inputs:
-            ts:  the timestamp to start searching back from
-            age: the max age of the records being searched
-
-        Returns:
-            An object of type ObsTuple where value is a 3 way tuple of
-            (value, x component, y component) and ts is the timestamp when
-            it occurred.
-        """
-
-        born = ts - age
-        snapshot = [a for a in self.history if a.ts >= born]
-        if len(snapshot) > 0:
-            _max = max(snapshot, key=itemgetter(1))
-            return ObsTuple(_max[0], _max[1])
-        else:
-            return None
-
-    @property
-    def hist_avg(self, ts, age=MAX_AGE):
-        """Return the average value in my history.
-
-        Search the last age seconds of my history for the max value and the
-        corresponding timestamp.
-
-        Inputs:
-            ts:  the timestamp to start searching back from
-            age: the max age of the records being searched
-
-        Returns:
-            An object of type ObsTuple where value is a 3 way tuple of
-            (value, x component, y component) and ts is the timestamp when
-            it occurred.
-        """
-
-        born = ts - age
-        snapshot = [a.value for a in self.history if a.ts >= born]
-        if len(snapshot) > 0:
-            return float(sum(snapshot)/len(snapshot))
-        else:
-            return None
-
 
 # ============================================================================
 #                             class VectorBuffer
@@ -2215,6 +2166,8 @@ class ObsBuffer(object):
 class VectorBuffer(ObsBuffer):
     """Class to buffer vector obs."""
 
+    # default initialisation tuple, format is:
+    # (min, mintime, max, maxtime, max_dir, sum, xsum, ysum, sumtime, count)
     default_init = (None, None, None, None, None, 0.0, 0.0, 0.0, 0.0, 0)
 
     def __init__(self, stats, units=None, history=False):
@@ -2225,8 +2178,8 @@ class VectorBuffer(ObsBuffer):
             self.min = stats.min
             self.mintime = stats.mintime
             self.max = stats.max
-            self.max_dir = stats.max_dir
             self.maxtime = stats.maxtime
+            self.max_dir = stats.max_dir
             self.sum = stats.sum
             self.xsum = stats.xsum
             self.ysum = stats.ysum
@@ -2235,14 +2188,19 @@ class VectorBuffer(ObsBuffer):
             self.nineam_sum = 0.0
         else:
             (self.min, self.mintime,
-             self.max, self.max_dir,
-             self.maxtime, self.sum,
+             self.max, self.maxtime,
+             self.max_dir, self.sum,
              self.xsum, self.ysum,
              self.sumtime, self.count) = VectorBuffer.default_init
             self.nineam_sum = 0.0
 
     def add_value(self, val, ts, hilo=True):
-        """Add a value to my hilo and history stats as required."""
+        """Add a value to my hilo and history stats as required.
+
+        val: an object of type VectorTuple
+        ts:  a unix epoch timestamp, may be None
+        hilo: whether or not to track min/max values for this obs, boolean
+        """
 
         if val.mag is not None:
             if hilo:
@@ -2269,7 +2227,7 @@ class VectorBuffer(ObsBuffer):
                 self.trim_history(ts)
 
     def day_reset(self):
-        """Reset the vector obs buffer."""
+        """Reset the vector obs buffer to the defaults."""
 
         (self.min, self.mintime,
          self.max, self.max_dir,
@@ -2278,13 +2236,17 @@ class VectorBuffer(ObsBuffer):
          self.sumtime, self.count) = VectorBuffer.default_init
 
     def nineam_reset(self):
-        """Reset the vector obs buffer."""
+        """Reset the vector obs buffer nineam properties."""
 
         self.nineam_sum = 0.0
 
     @property
     def day_vec_avg(self):
-        """The day average vector."""
+        """The day average vector.
+
+        Calculate the day average vector for a vector obs. Returns an object of
+        type VectorTuple.
+        """
 
         try:
             _magnitude = math.sqrt((self.xsum**2 + self.ysum**2) / self.sumtime**2)
@@ -2298,8 +2260,12 @@ class VectorBuffer(ObsBuffer):
     def hist_vec_avg(self):
         """The history average vector.
 
-        The period over which the average is calculated is the history
-        retention period (nominally 10 minutes).
+        Calculate the vector average of the obs in the history buffer. The
+        period over which the average is calculated is the history retention
+        period (nominally 10 minutes).
+
+        Returns an object of type VectorTuple. A result of (None, None) means
+        there were no obs in the history buffer.
         """
 
         # TODO. Check the maths here, time ?
@@ -2320,19 +2286,17 @@ class VectorBuffer(ObsBuffer):
     def hist_vec_dir(self):
         """The history vector average direction.
 
-        The period over which the average is calculated is the history
+        Calculate the vector average direction of the obs in the history
+        buffer. The period over which the average is calculated is the history
         retention period (nominally 10 minutes).
+
+        Returns a number or None. A result of None means there were no obs in
+        the history buffer.
         """
 
-        result = None
-        if self.use_history and len(self.history) > 0:
-            xy = [(ob.value.mag * math.cos(math.radians(90.0 - ob.value.dir)),
-                   ob.value.mag * math.sin(math.radians(90.0 - ob.value.dir))) for ob in self.history]
-            xsum = sum(x for x, y in xy)
-            ysum = sum(y for x, y in xy)
-            _direction = 90.0 - math.degrees(math.atan2(ysum, xsum))
-            result = _direction if _direction >= 0.0 else _direction + 360.0
-        return result
+        # we can simply return the direction component of the hist_vec_avg
+        # property
+        return self.hist_vec_avg.dir
 
 
 # ============================================================================
@@ -2342,12 +2306,15 @@ class VectorBuffer(ObsBuffer):
 class ScalarBuffer(ObsBuffer):
     """Class to buffer scalar obs."""
 
+    # default initialisation tuple, format is:
+    # (min, mintime, max, maxtime, sum, count)
     default_init = (None, None, None, None, 0.0, 0)
 
     def __init__(self, stats, units=None, history=False):
         # initialize my superclass
         super(ScalarBuffer, self).__init__(stats, units=units, history=history)
 
+        # if we have a stats dict then use it to initialise my properties
         if stats:
             self.min = stats.min
             self.mintime = stats.mintime
@@ -2357,6 +2324,7 @@ class ScalarBuffer(ObsBuffer):
             self.count = stats.count
             self.nineam_sum = 0.0
         else:
+            # we have not stats dict so initialise with the defaults
             (self.min, self.mintime,
              self.max, self.maxtime,
              self.sum, self.count) = ScalarBuffer.default_init
@@ -2373,12 +2341,12 @@ class ScalarBuffer(ObsBuffer):
                 if self.max is None or val > self.max:
                     self.max = val
                     self.maxtime = ts
+            self.count += 1
             self.sum += val
             self.nineam_sum += val
             if self.lasttime is None or ts >= self.lasttime:
                 self.last = val
                 self.lasttime = ts
-            self.count += 1
             if self.use_history:
                 self.history.append(ObsTuple(val, ts))
                 self.trim_history(ts)
@@ -2391,9 +2359,58 @@ class ScalarBuffer(ObsBuffer):
          self.sum, self.count) = ScalarBuffer.default_init
 
     def nineam_reset(self):
-        """Reset the scalar obs buffer."""
+        """Reset the scalar obs buffer nineam properties."""
 
         self.nineam_sum = 0.0
+
+    @property
+    def hist_max(self, ts, age=MAX_AGE):
+        """Return the max value in my history.
+
+        Search the last 'age' seconds of my history for the max value and the
+        corresponding timestamp.
+
+        Inputs:
+            ts:  the timestamp from which to start searching back
+            age: the max age of the records being searched
+
+        Returns:
+            An object of type ObsTuple where value is the maximum value and ts
+            is the timestamp when it occurred.
+        """
+
+        born = ts - age
+        # we are only interested in obs that are timestamped >= born
+        snapshot = [a for a in self.history if a.ts >= born]
+        if len(snapshot) > 0:
+            _max = max(snapshot, key=itemgetter(1))
+            return ObsTuple(_max[0], _max[1])
+        else:
+            return ObsTuple(None, None)
+
+    @property
+    def hist_avg(self, ts, age=MAX_AGE):
+        """Return the average value in my history.
+
+        Calculate the average of the obs in my history that are timestamped in
+        the last 'age' seconds.
+
+        Inputs:
+            ts:  the timestamp from which to start searching back from,
+                 nominally now
+            age: the max age of the records being searched
+
+        Returns:
+            The average value, a result of None indicates there were no obs in
+            the history period of concern.
+        """
+
+        born = ts - age
+        snapshot = [a.value for a in self.history if a.ts >= born]
+        if len(snapshot) > 0:
+            return float(sum(snapshot)/len(snapshot))
+        else:
+            return None
 
 
 # ============================================================================
@@ -2403,9 +2420,9 @@ class ScalarBuffer(ObsBuffer):
 class Buffer(dict):
     """Class to buffer various loop packet obs.
 
-    If archive based stats are an efficient means of getting stats for today.
-    However, their use would mean that any daily stat (eg today's max outTemp)
-    that 'occurs' after the most recent archive record but before the next
+    Archive based stats are an efficient means of getting stats for today.
+    However, their use would mean that any daily stats (eg today's max outTemp)
+    that occur after the most recent archive record but before the next
     archive record is written to archive will not be captured. For this reason
     selected loop data is buffered to ensure that such stats are correctly
     reflected.
@@ -2423,7 +2440,7 @@ class Buffer(dict):
             seed_func = seed_functions.get(obs, Buffer.seed_scalar)
             seed_func(self, day_stats, obs, history=obs in HIST_MANIFEST)
         # seed our buffer objects from additional_day_stats
-        if additional_day_stats:
+        if additional_day_stats is not None:
             for obs in [f for f in additional_day_stats if f in self.manifest]:
                 if obs not in self:
                     seed_func = seed_functions.get(obs, Buffer.seed_scalar)
@@ -2450,9 +2467,13 @@ class Buffer(dict):
     def add_packet(self, packet):
         """Add a packet to the buffer."""
 
+        # the packet must have a timestamp, if not discard it
         if packet['dateTime'] is not None:
+            # now iterate over all obs in the packet that are in our manifest
             for obs in [f for f in packet if f in self.manifest]:
+                # get the add function
                 add_func = add_functions.get(obs, Buffer.add_value)
+                # call the add function
                 add_func(self, packet, obs)
 
     def add_value(self, packet, obs):
@@ -2508,24 +2529,26 @@ class Buffer(dict):
                                    packet['dateTime'])
 
     def start_of_day_reset(self):
-        """Reset our buffer stats at the end of an archive period.
+        """Reset our buffer stats at the end of an archive day.
 
-        Reset our hi/lo data but don't touch the history, it might need to be
-        kept longer than the end of the archive period.
+        Call the day_reset() method for each obs in our manifest that we have
+        seen.
         """
 
         for obs in self.manifest:
-            self[obs].day_reset()
+            if obs in self:
+                self[obs].day_reset()
 
     def nineam_reset(self):
-        """Reset our buffer stats at the end of an archive period.
+        """Reset our nineam buffer stats.
 
-        Reset our hi/lo data but don't touch the history, it might need to be
-        kept longer than the end of the archive period.
+        Call the nineam_reset() method for each obs in our manifest that we
+        have seen.
         """
 
-        for obs in SUM_MANIFEST:
-            self[obs].nineam_reset()
+        for obs in self.manifest:
+            if obs in self:
+                self[obs].nineam_reset()
 
     def calc_windrun(self, packet):
         """Calculate windrun given windSpeed."""
@@ -2551,6 +2574,8 @@ class Buffer(dict):
 #                   Class Buffer configuration dictionaries
 # ============================================================================
 
+# in most cases we will use the default, here we can define those that need
+# special attention
 init_dict = weewx.units.ListOfDicts({'wind': VectorBuffer})
 add_functions = weewx.units.ListOfDicts({'windSpeed': Buffer.add_wind_value})
 seed_functions = weewx.units.ListOfDicts({'wind': Buffer.seed_vector})
@@ -2569,7 +2594,8 @@ class ObsTuple(tuple):
     contents can be accessed using named attributes.
 
     Item   attribute   Meaning
-     0     value       The observed value eg 19.5
+     0     value       The observed value eg 19.5, it can also be an object of
+                       type VectorTuple to represent a vector type obs
      1     ts          The epoch timestamp that the value was observed
                        eg 1488245400
 
@@ -2599,7 +2625,7 @@ class VectorTuple(tuple):
     """Class representing a vector observation.
 
     A vector value can be represented as a magnitude and direction. This can be
-    represented in a 2 way tuple called an vector tuple. A vector tuple is
+    represented in a 2 way tuple called a vector tuple. A vector tuple is
     useful because its contents can be accessed using named attributes.
 
     Item   attribute   Meaning
