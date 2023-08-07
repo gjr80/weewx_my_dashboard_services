@@ -183,17 +183,17 @@ class FailedPost(IOError):
 # ============================================================================
 
 class MqttDashboardService(weewx.engine.StdService):
-    """Base class Service that publishes data to an MQTT broker.
+    """Base class for a WeeWX service that publishes data to a MQTT broker.
 
-    Normally subclassed by a class using a threaded object to deal with an
-    external device/service.
+    The derived class normally uses a threaded object to deal with the MQTT
+    broker.
 
-    Creates a Queue object for passing loop packets and archive records to its
-    subordinate thread.
+    The base class creates a Queue object for passing loop packets and archive
+    records to its subordinate thread.
 
     Includes methods for placing loop packets and archive records in the Queue,
-    derived classes should include their own bindings to the relevant WeeWX
-    events to utilise these functions as required.
+    but does not include the required method bindings. Any binding should be
+    added to the derived classes as required.
 
     The shutDown method passes None via the Queue to the subordinate thread as
     a signal to shut down.
@@ -300,10 +300,10 @@ class MqttDashboardRealtime(MqttDashboardService):
                                                   mqtt_debug=mqtt_debug)
         self.thread.start()
 
-        # bind ourself to the WeeWX NEW_LOOP_PACKET event
+        # bind our self to the WeeWX NEW_LOOP_PACKET event
         self.bind(weewx.NEW_LOOP_PACKET, self.new_loop_packet)
 
-        # bind ourself to the WeeWX NEW_ARCHIVE_RECORD event
+        # bind our self to the WeeWX NEW_ARCHIVE_RECORD event
         self.bind(weewx.NEW_ARCHIVE_RECORD, self.new_archive_record)
 
 
@@ -2324,7 +2324,7 @@ class ScalarBuffer(ObsBuffer):
             self.count = stats.count
             self.nineam_sum = 0.0
         else:
-            # we have not stats dict so initialise with the defaults
+            # we have no stats dict so initialise with the defaults
             (self.min, self.mintime,
              self.max, self.maxtime,
              self.sum, self.count) = ScalarBuffer.default_init
@@ -2685,7 +2685,7 @@ def get_mqtt_broker_dict(config_dict, service, service_class_name, reqd_options=
                 if broker_dict[option] == 'replace_me':
                     raise KeyError(option)
         except KeyError as e:
-            logdbg("Service %s not loaded: Missing option %s" % (service_class_name, e)
+            logdbg("Service %s not loaded: Missing option %s" % (service_class_name, e))
             return None
 
     # If the broker dictionary does not have a log_success or log_failure, get
@@ -2697,6 +2697,7 @@ def get_mqtt_broker_dict(config_dict, service, service_class_name, reqd_options=
     broker_dict.pop('enable', None)
 
     return broker_dict
+
 
 def obfuscate_password(url, o_str='xxx'):
     """Obfuscate the 'password' portion of a URL.
